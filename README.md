@@ -1,60 +1,80 @@
-# VolleyVision AI - Vercel Browser Mode
+# VolleyVision AI - Safe Video Storage Build
 
-This version is designed to work directly on Vercel without a separate FastAPI backend.
+This build is designed to avoid the Git/Vercel problems caused by generated video files being added to Source Control.
 
-## What works on Vercel
+## What changed
 
-- Upload a video in the browser
-- Upload/progress bar
-- Match list for the current browser session
-- Delete/remove videos
-- Clickable rally breakdown rows
-- Jump video to event timestamps
-- Preview Top 5 highlight playback
-- Preview rally-only playback that skips dead time
-- Roster/body-build hints
-- Estimated player assignment across all roster players
-- Manual tags at the current video time
+- Videos are saved safely in browser IndexedDB in the Vercel/browser version.
+- Video files are **not** saved into the Git repository.
+- `.gitignore` blocks uploads, clips, databases, build folders, node modules, and common video formats.
+- The app limits the browser video library to keep production from slowing down:
+  - 750 MB max per video
+  - 2 GB max total browser storage
+  - 8 saved videos max
+- Removing a video deletes it from browser storage too.
+- Added `scripts/clean-git-generated-files.ps1` for cleanup if generated files ever appear in Source Control again.
 
-## Important limitation
+## Run locally
 
-Because this runs on Vercel frontend only, videos are not saved permanently. They stay in the current browser session through object URLs. Refreshing the page clears uploaded videos.
-
-For permanent cloud uploads, real FFmpeg-generated MP4 exports, true player tracking, jersey OCR, and trained volleyball AI, deploy the FastAPI backend separately on Render, Railway, or Fly.io and connect it with `NEXT_PUBLIC_API_URL`.
-
-## Vercel settings
-
-Set the Vercel project settings to:
-
-- Framework Preset: Next.js
-- Root Directory: `apps/web`
-- Install Command: `npm install`
-- Build Command: `npm run build`
-- Output Directory: leave blank
-
-## Local run
-
-```bash
+```powershell
 cd apps/web
 npm install
 npm run dev
 ```
 
-Then open:
+Open:
 
 ```text
 http://localhost:3000
 ```
 
-## Version 3 updates
+## Deploy on Vercel
 
-This Vercel browser-mode update adds:
+Use these Vercel settings:
 
-- Rally objects with multiple touches/actions inside each rally
-- Serve receive -> set -> attack -> block/dig/cover sequences
-- Player assignment based on roster role/body-build hints
-- Live event tracker that follows the video time
-- Auto-scrolling highlighted event row as the video plays
-- Click-to-jump for each touch and rally
+```text
+Root Directory: apps/web
+Framework Preset: Next.js
+Build Command: npm run build
+Output Directory: blank
+Install Command: npm install
+```
 
-Note: this is still browser-mode estimation. Real recognition of exact player/action from film requires a deployed computer vision backend using player detection, tracking, pose/ball detection, and jersey OCR.
+## Safe Git workflow
+
+Before committing, check:
+
+```powershell
+git status
+```
+
+You should **not** see:
+
+```text
+apps/api/storage/
+node_modules/
+.next/
+*.mp4
+*.db
+```
+
+If generated files show up, run:
+
+```powershell
+.\scripts\clean-git-generated-files.ps1
+git commit -m "Stop tracking generated files"
+git push
+```
+
+## Important production note
+
+Browser IndexedDB is safe for Vercel because it does not push videos into Git or Vercel builds. It is good for demos and personal use.
+
+For a real team production app where players/coaches need videos saved across devices/accounts, connect cloud object storage later:
+
+- Vercel Blob
+- Cloudflare R2
+- AWS S3
+- Supabase Storage
+
+Do not store uploaded videos directly in GitHub or inside the Vercel deployment bundle.
