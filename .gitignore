@@ -1,0 +1,11 @@
+node_modules/
+.next/
+.venv/
+apps/api/.venv/
+__pycache__/
+*.pyc
+*.db
+apps/api/storage/
+apps/api/storage/uploads/
+apps/api/storage/clips/
+.env
