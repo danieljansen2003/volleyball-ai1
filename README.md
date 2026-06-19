@@ -1,80 +1,42 @@
-# VolleyVision AI - Safe Video Storage Build
+# VolleyVision AI - Vercel Blob Upload Build
 
-This build is designed to avoid the Git/Vercel problems caused by generated video files being added to Source Control.
+This version uploads full match videos to **Vercel Blob** instead of browser IndexedDB or local backend storage.
 
 ## What changed
 
-- Videos are saved safely in browser IndexedDB in the Vercel/browser version.
-- Video files are **not** saved into the Git repository.
-- `.gitignore` blocks uploads, clips, databases, build folders, node modules, and common video formats.
-- The app limits the browser video library to keep production from slowing down:
-  - 750 MB max per video
-  - 2 GB max total browser storage
-  - 8 saved videos max
-- Removing a video deletes it from browser storage too.
-- Added `scripts/clean-git-generated-files.ps1` for cleanup if generated files ever appear in Source Control again.
+- Videos upload directly from the browser to Vercel Blob using `@vercel/blob/client`.
+- The app saves only match metadata and the Blob video URL in browser localStorage.
+- Videos are not committed to GitHub and are not included in Vercel builds.
+- Added API routes:
+  - `apps/web/app/api/blob-upload/route.ts`
+  - `apps/web/app/api/blob-delete/route.ts`
+- Added `.npmrc` files to force the public npm registry.
+- Removed package-lock files so you can regenerate a clean lockfile locally.
 
-## Run locally
+## Required Vercel setup
 
-```powershell
+1. Create/connect a Vercel Blob store to the Vercel project.
+2. Make sure the project has `BLOB_READ_WRITE_TOKEN` in Environment Variables.
+3. Redeploy with existing build cache disabled.
+
+## Local setup
+
+```bash
 cd apps/web
-npm install
+npm install --registry=https://registry.npmjs.org/
 npm run dev
 ```
 
-Open:
+## Push steps
 
-```text
-http://localhost:3000
-```
-
-## Deploy on Vercel
-
-Use these Vercel settings:
-
-```text
-Root Directory: apps/web
-Framework Preset: Next.js
-Build Command: npm run build
-Output Directory: blank
-Install Command: npm install
-```
-
-## Safe Git workflow
-
-Before committing, check:
-
-```powershell
-git status
-```
-
-You should **not** see:
-
-```text
-apps/api/storage/
-node_modules/
-.next/
-*.mp4
-*.db
-```
-
-If generated files show up, run:
-
-```powershell
-.\scripts\clean-git-generated-files.ps1
-git commit -m "Stop tracking generated files"
+```bash
+git add .
+git commit -m "Add Vercel Blob video uploads"
 git push
 ```
 
-## Important production note
+Then redeploy on Vercel with **Use Existing Build Cache** turned off.
 
-Browser IndexedDB is safe for Vercel because it does not push videos into Git or Vercel builds. It is good for demos and personal use.
+## Note
 
-For a real team production app where players/coaches need videos saved across devices/accounts, connect cloud object storage later:
-
-- Vercel Blob
-- Cloudflare R2
-- AWS S3
-- Supabase Storage
-
-Do not store uploaded videos directly in GitHub or inside the Vercel deployment bundle.
+The current AI event detection is still a browser-side estimator. Real action/player recognition requires a separate backend worker with CV models.
