@@ -1,15 +1,13 @@
 services:
-  api:
-    build: ./apps/api
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./apps/api/storage:/app/storage
   web:
     build: ./apps/web
     ports:
       - "3000:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
-    depends_on:
-      - api
+      - AI_WORKER_URL=http://ai-worker:9000
+  ai-worker:
+    build: ./apps/ai-worker
+    ports:
+      - "9000:9000"
+    environment:
+      - MAX_VIDEO_DOWNLOAD_MB=2048

@@ -37,7 +37,6 @@ type Match = {
   video_url: string;
   local_preview_url?: string;
   upload_progress?: number;
-  analysis_start_time?: number;
   filename: string;
   file_size?: number;
   storage_provider: "vercel-blob";
@@ -102,7 +101,7 @@ function rolePick(roster: RosterPlayer[], role: string, fallbackIndex: number) {
   return hit || roster[fallbackIndex % roster.length];
 }
 
-function makeRallies(duration: number, matchId: number, roster: RosterPlayer[], analysisStartTime = 0) {
+function makeRallies(duration: number, matchId: number, roster: RosterPlayer[]) {
   const rallies: Rally[] = [];
   const phases = [
     "Serve receive",
@@ -113,9 +112,7 @@ function makeRallies(duration: number, matchId: number, roster: RosterPlayer[], 
   ];
   const results = ["kill", "kept alive", "error", "tip covered", "block touch", "point won"];
 
-  // Do not create touches during pre-game / standing-around footage.
-  // The user can mark the first real serve, and all generated rallies start after that marker.
-  let t = Math.max(0, analysisStartTime);
+  let t = 4;
   let i = 0;
   while (t < duration - 5) {
     const rallyLength = Math.min(9 + (i % 5) * 2.5, Math.max(5, duration - t));
@@ -192,7 +189,6 @@ export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const activeRowRef = useRef<HTMLTableRowElement | null>(null);
   const uploadStartedAtRef = useRef<number>(0);
-  const lastProgressRef = useRef({ loaded: 0, pct: 0, time: 0 });
   const localPreviewUrlsRef = useRef<string[]>([]);
   const [matches, setMatches] = useState<Match[]>([]);
   const [libraryReady, setLibraryReady] = useState(false);
@@ -205,7 +201,8 @@ export default function Home() {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadStatus, setUploadStatus] = useState("Idle");
   const [uploadSpeed, setUploadSpeed] = useState("");
-  const [analysisStatus, setAnalysisStatus] = useState("Upload a video, then mark the first real serve to avoid pre-game fake events.");
+  const [analyzeStatus, setAnalyzeStatus] = useState("AI worker not run yet");
+  const [analyzing, setAnalyzing] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [currentTouchId, setCurrentTouchId] = useState<number | null>(null);
   const [currentRallyId, setCurrentRallyId] = useState<number | null>(null);
@@ -264,11 +261,11 @@ export default function Home() {
   );
   const top5Rallies = useMemo(() => [...sortedRallies].sort((a, b) => b.confidence - a.confidence).slice(0, 5), [sortedRallies]);
   const activeTouch = useMemo(
-    () => allTouches.find((t) => currentTime >= t.start_time && currentTime < t.end_time) || null,
+    () => allTouches.find((t) => currentTime >= t.start_time && currentTime < t.end_time) || allTouches.filter((t) => t.start_time <= currentTime).at(-1) || null,
     [allTouches, currentTime],
   );
   const activeRally = useMemo(
-    () => sortedRallies.find((r) => currentTime >= r.start_time && currentTime < r.end_time) || null,
+    () => sortedRallies.find((r) => currentTime >= r.start_time && currentTime < r.end_time) || sortedRallies.filter((r) => r.start_time <= currentTime).at(-1) || null,
     [sortedRallies, currentTime],
   );
 
@@ -300,7 +297,6 @@ export default function Home() {
     setUploadProgress(0);
     setUploadSpeed("");
     setUploadStatus("Preparing instant local preview...");
-    setAnalysisStatus("Preview is available immediately. Breakdown will wait until you mark the first real serve.");
     setPlaybackMode("normal");
 
     const matchId = Date.now();
@@ -329,8 +325,7 @@ export default function Home() {
       status: "uploading to Vercel Blob",
       duration_seconds: guessedDuration,
       created_at: new Date().toISOString(),
-      rallies: [],
-      analysis_start_time: undefined,
+      rallies: makeRallies(guessedDuration, matchId, roster),
       video_url: localPreviewUrl,
       local_preview_url: localPreviewUrl,
       upload_progress: 0,
@@ -348,38 +343,30 @@ export default function Home() {
         const withRealDuration = {
           ...instantMatch,
           duration_seconds: duration,
-          rallies: [],
+          rallies: makeRallies(duration, matchId, roster),
         };
         setSelected(withRealDuration);
         setMatches((prev) => prev.map((m) => (m.id === matchId ? withRealDuration : m)));
       }
 
       uploadStartedAtRef.current = Date.now();
-      lastProgressRef.current = { loaded: 0, pct: 0, time: Date.now() };
       setUploadStatus("Uploading full match to Vercel Blob...");
 
       const blob = await uploadToBlob(pathname, file, {
         access: "public",
         handleUploadUrl: "/api/blob-upload",
         onUploadProgress: (event) => {
+          const loaded = event.loaded || 0;
           const total = event.total || file.size || 1;
-          const rawLoaded = event.loaded || 0;
-          const rawPct = typeof event.percentage === "number" ? event.percentage : Math.round((rawLoaded / Math.max(1, total)) * 100);
-          // Some large-file upload libraries emit per-part progress that can appear to reset.
-          // Keep the UI monotonic so the progress bar never jumps backward or restarts.
-          const previous = lastProgressRef.current;
-          const pct = Math.max(previous.pct, Math.max(1, Math.min(99, rawPct)));
-          const loaded = Math.max(previous.loaded, Math.round((pct / 100) * total), rawLoaded);
-          const now = Date.now();
-          const elapsed = Math.max(1, (now - uploadStartedAtRef.current) / 1000);
-          const averageMbps = loaded / 1024 / 1024 / elapsed;
-          lastProgressRef.current = { loaded, pct, time: now };
-          setUploadProgress(pct);
-          setUploadSpeed(`${averageMbps.toFixed(1)} MB/s avg · ${bytesToSize(loaded)} / ${bytesToSize(total)}`);
+          const pct = typeof event.percentage === "number" ? event.percentage : Math.round((loaded / Math.max(1, total)) * 100);
+          const elapsed = Math.max(1, (Date.now() - uploadStartedAtRef.current) / 1000);
+          const mbps = loaded / 1024 / 1024 / elapsed;
+          setUploadProgress(Math.max(1, Math.min(99, pct)));
+          setUploadSpeed(`${mbps.toFixed(1)} MB/s · ${bytesToSize(loaded)} / ${bytesToSize(total)}`);
           setMatches((prev) =>
             prev.map((m) =>
               m.id === matchId
-                ? { ...m, status: `uploading ${pct}%`, upload_progress: pct }
+                ? { ...m, status: `uploading ${Math.max(1, Math.min(99, pct))}%`, upload_progress: Math.max(1, Math.min(99, pct)) }
                 : m,
             ),
           );
@@ -387,8 +374,7 @@ export default function Home() {
       });
 
       setUploadProgress(100);
-      setUploadStatus("Upload complete. Cloud video is ready. Now mark the first real serve.");
-      setAnalysisStatus("Upload complete. Scrub to the first real serve, then click Mark first serve here to generate the rally breakdown.");
+      setUploadStatus("Upload complete. Cloud video is ready.");
       const finalized = {
         ...(matches.find((m) => m.id === matchId) || instantMatch),
         status: "saved to Vercel Blob",
@@ -408,6 +394,47 @@ export default function Home() {
       alert("Cloud upload failed. Confirm BLOB_READ_WRITE_TOKEN is connected to the Vercel project, redeploy, and try again. For very large files, keep the tab open during upload.");
     } finally {
       setLoading(false);
+    }
+  }
+
+
+  async function runAiWorker(match: Match, firstServeSeconds = currentTime) {
+    if (!match.video_url || match.video_url.startsWith("blob:")) {
+      return alert("Wait until the Vercel Blob upload finishes before running AI worker analysis.");
+    }
+
+    setAnalyzing(true);
+    setAnalyzeStatus("Sending match to AI worker...");
+    try {
+      const response = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          match_id: match.id,
+          title: match.title,
+          opponent: match.opponent,
+          video_url: match.video_url,
+          duration_seconds: match.duration_seconds,
+          first_serve_seconds: firstServeSeconds,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "AI worker failed");
+
+      const updated = {
+        ...match,
+        status: `AI analyzed: ${data.model_version || "worker"}`,
+        rallies: data.rallies || [],
+      };
+      setSelected(updated);
+      setMatches((prev) => prev.map((m) => (m.id === match.id ? updated : m)));
+      setAnalyzeStatus(data.message || "AI worker analysis complete. Review and correct the tags.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "AI worker failed";
+      setAnalyzeStatus(message);
+      alert(message);
+    } finally {
+      setAnalyzing(false);
     }
   }
 
@@ -433,34 +460,6 @@ export default function Home() {
     setMatches([]);
     setSelected(null);
     setPlaybackMode("normal");
-  }
-
-  function regenerateBreakdownFrom(startTime: number) {
-    if (!selected) return;
-    const safeStart = Math.max(0, Math.min(startTime, Math.max(0, selected.duration_seconds - 5)));
-    const updated: Match = {
-      ...selected,
-      analysis_start_time: safeStart,
-      rallies: makeRallies(selected.duration_seconds, selected.id, roster, safeStart),
-      status: selected.status.includes("uploading") ? selected.status : "breakdown generated",
-    };
-    setSelected(updated);
-    setMatches((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
-    setAnalysisStatus(`Generated rally sequence starting at ${formatTime(safeStart)}. Use this after the first real serve, not during warmups or standing-around time.`);
-  }
-
-  function markFirstServeHere() {
-    if (!selected) return alert("Upload or select a match first.");
-    const start = videoRef.current?.currentTime || 0;
-    regenerateBreakdownFrom(start);
-  }
-
-  function clearGeneratedBreakdown() {
-    if (!selected) return;
-    const updated = { ...selected, rallies: [], analysis_start_time: undefined, status: selected.status.includes("uploading") ? selected.status : "waiting for first serve" };
-    setSelected(updated);
-    setMatches((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
-    setAnalysisStatus("Breakdown cleared. Move the video to the first real serve, then click Mark first serve.");
   }
 
   function addManualTouch() {
@@ -551,7 +550,7 @@ export default function Home() {
     return acc;
   }, {});
   const rallySeconds = sortedRallies.reduce((sum, e) => sum + Math.max(0, e.end_time - e.start_time), 0);
-  const deadTimeRemoved = sortedRallies.length ? Math.max(0, (selected?.duration_seconds || 0) - rallySeconds) : 0;
+  const deadTimeRemoved = Math.max(0, (selected?.duration_seconds || 0) - rallySeconds);
 
   return (
     <main className="min-h-screen p-6">
@@ -577,7 +576,7 @@ export default function Home() {
                 </div>
               )}
               <button onClick={upload} disabled={loading} className="mt-4 w-full rounded-xl bg-cyan-400 px-4 py-3 font-bold text-slate-950 hover:bg-cyan-300 disabled:opacity-60">
-                {loading ? "Uploading to Blob..." : "Upload + Preview"}
+                {loading ? "Uploading to Blob..." : "Upload + Process"}
               </button>
               <p className="mt-3 text-xs text-white/50">{storageMessage}</p>
               <p className="mt-1 text-xs text-white/40">Videos are stored in Vercel Blob and only URLs/metadata are saved in this browser. During upload, the app uses the local file for instant preview so playback starts faster.</p>
@@ -622,24 +621,20 @@ export default function Home() {
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div><h2 className="text-2xl font-black">{selected.title}</h2><p className="text-white/70">vs {selected.opponent} · {formatTime(selected.duration_seconds)} · {selected.status}</p></div>
                     <div className="flex flex-wrap gap-2">
+                      <button disabled={analyzing || selected.video_url.startsWith("blob:")} onClick={() => runAiWorker(selected, currentTime)} className="rounded-xl bg-purple-400 px-4 py-2 font-bold text-slate-950 hover:bg-purple-300 disabled:opacity-50">{analyzing ? "AI analyzing..." : "Run AI worker from current time"}</button>
                       <button disabled={!top5Rallies.length} onClick={() => playPlaylist(top5Rallies, "top5")} className="rounded-xl bg-cyan-400 px-4 py-2 font-bold text-slate-950 hover:bg-cyan-300 disabled:opacity-50">Preview top 5 rallies</button>
                       <button disabled={!sortedRallies.length} onClick={() => playPlaylist(sortedRallies, "rally-only")} className="rounded-xl bg-green-400 px-4 py-2 font-bold text-slate-950 hover:bg-green-300 disabled:opacity-50">Play rally-only</button>
                       {playbackMode !== "normal" && <button onClick={() => setPlaybackMode("normal")} className="rounded-xl bg-white/15 px-4 py-2 font-bold hover:bg-white/25">Stop smart playback</button>}
                     </div>
                   </div>
                   <video ref={videoRef} className="mt-5 w-full rounded-xl bg-black" controls playsInline preload="metadata" src={selected.local_preview_url || selected.video_url} />
-                  <div className="mt-4 grid gap-3 rounded-xl bg-slate-950/50 p-4 ring-1 ring-white/10 md:grid-cols-[1fr_auto_auto]">
-                    <div>
-                      <div className="text-sm uppercase tracking-widest text-cyan-200">Analysis start · {selected.analysis_start_time !== undefined ? formatTime(selected.analysis_start_time) : "not marked"}</div>
-                      <div className="text-sm text-white/60">{analysisStatus}</div>
-                    </div>
-                    <button onClick={markFirstServeHere} className="rounded-xl bg-yellow-300 px-4 py-2 font-bold text-slate-950 hover:bg-yellow-200">Mark first serve here</button>
-                    <button onClick={clearGeneratedBreakdown} className="rounded-xl bg-white/15 px-4 py-2 font-bold hover:bg-white/25">Clear breakdown</button>
+                  <div className="mt-3 rounded-xl bg-purple-950/40 p-3 text-sm text-purple-100 ring-1 ring-purple-300/20">
+                    <strong>AI worker:</strong> {analyzeStatus}. Scrub to the first real serve, then click <strong>Run AI worker from current time</strong>. The starter worker detects likely live rallies only; pass/set/attack labels should come from your trained action model later.
                   </div>
                   <div className="mt-4 rounded-xl bg-slate-950/50 p-4 ring-1 ring-white/10">
                     <div className="text-sm uppercase tracking-widest text-cyan-200">Live tracker · {formatTime(currentTime)}</div>
-                    <div className="mt-2 text-2xl font-black">{activeTouch ? `${activeTouch.action}: ${activeTouch.player}` : selected.rallies.length ? "Between touches / dead time" : "No generated touches yet"}</div>
-                    <div className="text-white/70">{activeRally ? `${activeRally.phase} → ${activeRally.result}` : selected.rallies.length ? "No active rally at this moment." : "Move to the first real serve, then click Mark first serve here."}</div>
+                    <div className="mt-2 text-2xl font-black">{activeTouch ? `${activeTouch.action}: ${activeTouch.player}` : "No active touch yet"}</div>
+                    <div className="text-white/70">{activeRally ? `${activeRally.phase} → ${activeRally.result}` : "Press play to follow the breakdown."}</div>
                   </div>
                 </div>
 
@@ -675,9 +670,6 @@ export default function Home() {
                     <table className="w-full text-sm">
                       <thead className="sticky top-0 bg-slate-900 text-left"><tr><th className="p-3">Time</th><th>Rally</th><th>Action sequence</th><th>Player</th><th>Outcome</th><th>Confidence</th></tr></thead>
                       <tbody>
-                        {!sortedRallies.length && (
-                          <tr><td colSpan={6} className="p-6 text-center text-white/60">No generated rallies yet. Play the video to the first real serve, then click <b>Mark first serve here</b>. This prevents pre-game standing-around time from being labeled as volleyball actions.</td></tr>
-                        )}
                         {sortedRallies.map((r) =>
                           r.touches.map((t, idx) => (
                             <tr ref={currentTouchId === t.id ? activeRowRef : null} key={t.id} onClick={() => jumpToTime(t.start_time)} title={t.notes} className={`cursor-pointer border-t border-white/10 hover:bg-cyan-400/20 ${currentTouchId === t.id ? "bg-cyan-400/40" : currentRallyId === r.id ? "bg-cyan-400/10" : ""}`}>
