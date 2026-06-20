@@ -1,23 +1,25 @@
-# VolleyVision AI - Vercel Blob Fast Upload Build
+# VolleyVision AI - Blob Upload + First Serve Marker
 
-This version uploads match videos to Vercel Blob and improves the upload/playback experience:
+This build keeps full-match videos out of Git and out of browser storage by uploading video files to Vercel Blob.
 
-- Uses the selected local file for instant playback while the cloud upload runs.
-- Tracks real upload progress from `@vercel/blob/client`.
-- Shows upload speed and uploaded/total bytes.
-- Keeps cloud URL metadata only in browser localStorage.
-- Keeps videos out of GitHub and Vercel builds.
-- Uses `preload="metadata"` so remote Blob videos start loading metadata instead of trying to load the full file.
+## New fixes
 
-## Required Vercel setup
+- Video preview starts immediately from the local selected file while the Blob upload continues.
+- Upload progress is monotonic, so the progress bar does not jump backward or restart when large-file upload chunks report progress.
+- The app no longer generates fake volleyball actions during pre-game standing-around footage.
+- After upload, scrub the video to the first real serve and click **Mark first serve here**.
+- Rally/touch sequences are generated only after the marked first serve.
+- The live tracker now shows "Between touches / dead time" instead of pretending there is an action happening.
 
-Your Vercel project must have these environment variables:
+## Required Vercel setting
 
-- `BLOB_READ_WRITE_TOKEN`
-- `BLOB_STORE_ID`
-- `BLOB_WEBHOOK_PUBLIC_KEY`
+Your project must have this environment variable:
 
-When connecting Blob storage, check **Add a read-write token env var to this connection**.
+```text
+BLOB_READ_WRITE_TOKEN
+```
+
+Connect your Vercel Blob store to the project and check **Add a read-write token env var to this connection**.
 
 ## Deploy
 
@@ -26,8 +28,8 @@ cd apps\web
 npm install --registry=https://registry.npmjs.org/
 cd ..\..
 git add .
-git commit -m "Improve Blob upload progress and playback"
+git commit -m "Improve upload progress and first serve tracking"
 git push
 ```
 
-Redeploy on Vercel after pushing.
+Then redeploy in Vercel.
