@@ -35,6 +35,8 @@ type Match = {
   created_at: string;
   rallies: Rally[];
   video_url: string;
+  local_preview_url?: string;
+  upload_progress?: number;
   filename: string;
   file_size?: number;
   storage_provider: "vercel-blob";
@@ -76,10 +78,11 @@ function readMatchLibrary(): Match[] {
 }
 
 function saveMatchLibrary(matches: Match[]) {
-  window.localStorage.setItem(
-    MATCH_LIBRARY_KEY,
-    JSON.stringify(matches.slice(0, MAX_METADATA_MATCHES)),
-  );
+  const persistable = matches.slice(0, MAX_METADATA_MATCHES).map(({ local_preview_url, ...match }) => ({
+    ...match,
+    upload_progress: match.status.includes("upload") ? 0 : match.upload_progress,
+  }));
+  window.localStorage.setItem(MATCH_LIBRARY_KEY, JSON.stringify(persistable));
 }
 
 function playerText(p?: RosterPlayer) {
@@ -185,6 +188,8 @@ function makeRallies(duration: number, matchId: number, roster: RosterPlayer[]) 
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const activeRowRef = useRef<HTMLTableRowElement | null>(null);
+  const uploadStartedAtRef = useRef<number>(0);
+  const localPreviewUrlsRef = useRef<string[]>([]);
   const [matches, setMatches] = useState<Match[]>([]);
   const [libraryReady, setLibraryReady] = useState(false);
   const [storageMessage, setStorageMessage] = useState("Videos upload to Vercel Blob and stay out of Git.");
@@ -194,6 +199,8 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadStatus, setUploadStatus] = useState("Idle");
+  const [uploadSpeed, setUploadSpeed] = useState("");
   const [currentTime, setCurrentTime] = useState(0);
   const [currentTouchId, setCurrentTouchId] = useState<number | null>(null);
   const [currentRallyId, setCurrentRallyId] = useState<number | null>(null);
@@ -238,6 +245,13 @@ export default function Home() {
     setStorageMessage(`${matches.length} cloud videos · ${bytesToSize(total)} referenced from Vercel Blob`);
   }, [matches, libraryReady]);
 
+  useEffect(() => {
+    return () => {
+      localPreviewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      localPreviewUrlsRef.current = [];
+    };
+  }, []);
+
   const sortedRallies = useMemo(() => [...(selected?.rallies || [])].sort((a, b) => a.start_time - b.start_time), [selected]);
   const allTouches = useMemo(
     () => sortedRallies.flatMap((r) => r.touches.map((t) => ({ ...t, rally: r }))).sort((a, b) => a.start_time - b.start_time),
@@ -279,63 +293,106 @@ export default function Home() {
 
     setLoading(true);
     setUploadProgress(0);
+    setUploadSpeed("");
+    setUploadStatus("Preparing instant local preview...");
     setPlaybackMode("normal");
 
     const matchId = Date.now();
     const safeName = file.name.replace(/[^a-zA-Z0-9_.-]/g, "_");
     const pathname = `matches/${matchId}-${safeName}`;
     const localPreviewUrl = URL.createObjectURL(file);
+    localPreviewUrlsRef.current.push(localPreviewUrl);
+
     const probe = document.createElement("video");
     probe.preload = "metadata";
+    probe.muted = true;
     probe.src = localPreviewUrl;
 
-    probe.onloadedmetadata = async () => {
-      try {
-        const blob = await uploadToBlob(pathname, file, {
-          access: "public",
-          handleUploadUrl: "/api/blob-upload",
-          onUploadProgress: (event) => {
-            const pct = typeof event.percentage === "number" ? event.percentage : Math.round((event.loaded / Math.max(1, event.total)) * 100);
-            setUploadProgress(Math.max(1, Math.min(99, pct)));
-          },
-        });
+    const readMetadata = new Promise<number>((resolve) => {
+      const done = () => resolve(Number.isFinite(probe.duration) ? probe.duration : 0);
+      probe.onloadedmetadata = done;
+      probe.onerror = () => resolve(0);
+      setTimeout(() => resolve(0), 2500);
+    });
 
-        const duration = Number.isFinite(probe.duration) ? probe.duration : 0;
-        const rallies = makeRallies(duration, matchId, roster);
-        const match: Match = {
-          id: matchId,
-          title,
-          opponent,
-          status: "saved to Vercel Blob",
+    const guessedDuration = file.size > 4 * 1024 * 1024 * 1024 ? 90 * 60 : 60 * 60;
+    const instantMatch: Match = {
+      id: matchId,
+      title,
+      opponent,
+      status: "uploading to Vercel Blob",
+      duration_seconds: guessedDuration,
+      created_at: new Date().toISOString(),
+      rallies: makeRallies(guessedDuration, matchId, roster),
+      video_url: localPreviewUrl,
+      local_preview_url: localPreviewUrl,
+      upload_progress: 0,
+      filename: file.name,
+      file_size: file.size,
+      storage_provider: "vercel-blob",
+    };
+
+    setMatches((prev) => [instantMatch, ...prev].slice(0, MAX_METADATA_MATCHES));
+    setSelected(instantMatch);
+
+    try {
+      const duration = await readMetadata;
+      if (duration > 0) {
+        const withRealDuration = {
+          ...instantMatch,
           duration_seconds: duration,
-          created_at: new Date().toISOString(),
-          rallies,
-          video_url: blob.url,
-          filename: file.name,
-          file_size: file.size,
-          storage_provider: "vercel-blob",
+          rallies: makeRallies(duration, matchId, roster),
         };
-        URL.revokeObjectURL(localPreviewUrl);
-        const next = [match, ...matches].slice(0, MAX_METADATA_MATCHES);
-        setMatches(next);
-        setSelected(match);
-        setUploadProgress(100);
-        setLoading(false);
-      } catch (err) {
-        console.error(err);
-        URL.revokeObjectURL(localPreviewUrl);
-        setLoading(false);
-        setUploadProgress(0);
-        alert("Cloud upload failed. Confirm BLOB_READ_WRITE_TOKEN is connected to the Vercel project and redeploy.");
+        setSelected(withRealDuration);
+        setMatches((prev) => prev.map((m) => (m.id === matchId ? withRealDuration : m)));
       }
-    };
 
-    probe.onerror = () => {
-      URL.revokeObjectURL(localPreviewUrl);
-      setLoading(false);
+      uploadStartedAtRef.current = Date.now();
+      setUploadStatus("Uploading full match to Vercel Blob...");
+
+      const blob = await uploadToBlob(pathname, file, {
+        access: "public",
+        handleUploadUrl: "/api/blob-upload",
+        onUploadProgress: (event) => {
+          const loaded = event.loaded || 0;
+          const total = event.total || file.size || 1;
+          const pct = typeof event.percentage === "number" ? event.percentage : Math.round((loaded / Math.max(1, total)) * 100);
+          const elapsed = Math.max(1, (Date.now() - uploadStartedAtRef.current) / 1000);
+          const mbps = loaded / 1024 / 1024 / elapsed;
+          setUploadProgress(Math.max(1, Math.min(99, pct)));
+          setUploadSpeed(`${mbps.toFixed(1)} MB/s · ${bytesToSize(loaded)} / ${bytesToSize(total)}`);
+          setMatches((prev) =>
+            prev.map((m) =>
+              m.id === matchId
+                ? { ...m, status: `uploading ${Math.max(1, Math.min(99, pct))}%`, upload_progress: Math.max(1, Math.min(99, pct)) }
+                : m,
+            ),
+          );
+        },
+      });
+
+      setUploadProgress(100);
+      setUploadStatus("Upload complete. Cloud video is ready.");
+      const finalized = {
+        ...(matches.find((m) => m.id === matchId) || instantMatch),
+        status: "saved to Vercel Blob",
+        video_url: blob.url,
+        local_preview_url: localPreviewUrl,
+        upload_progress: 100,
+      };
+      setSelected((current) => (current?.id === matchId ? finalized : current));
+      setMatches((prev) => prev.map((m) => (m.id === matchId ? finalized : m)));
+    } catch (err) {
+      console.error(err);
+      setUploadStatus("Upload failed");
       setUploadProgress(0);
-      alert("Could not read that video file. Try an MP4 file.");
-    };
+      setUploadSpeed("");
+      setMatches((prev) => prev.filter((m) => m.id !== matchId));
+      setSelected((current) => (current?.id === matchId ? null : current));
+      alert("Cloud upload failed. Confirm BLOB_READ_WRITE_TOKEN is connected to the Vercel project, redeploy, and try again. For very large files, keep the tab open during upload.");
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function deleteMatch(match: Match) {
@@ -471,15 +528,15 @@ export default function Home() {
               {file && <p className="mt-2 text-xs text-white/60">Selected: {file.name} · {bytesToSize(file.size)}</p>}
               {(loading || uploadProgress > 0) && (
                 <div className="mt-4">
-                  <div className="mb-1 flex justify-between text-xs text-white/70"><span>Cloud upload progress</span><span>{uploadProgress}%</span></div>
-                  <div className="h-3 overflow-hidden rounded-full bg-white/10"><div className="h-full bg-cyan-400 transition-all" style={{ width: `${uploadProgress}%` }} /></div>
+                  <div className="mb-1 flex justify-between text-xs text-white/70"><span>{uploadStatus}</span><span>{uploadProgress}%</span></div>
+                  <div className="h-3 overflow-hidden rounded-full bg-white/10"><div className="h-full bg-cyan-400 transition-all" style={{ width: `${uploadProgress}%` }} /></div>{uploadSpeed && <p className="mt-1 text-xs text-white/50">{uploadSpeed}</p>}
                 </div>
               )}
               <button onClick={upload} disabled={loading} className="mt-4 w-full rounded-xl bg-cyan-400 px-4 py-3 font-bold text-slate-950 hover:bg-cyan-300 disabled:opacity-60">
                 {loading ? "Uploading to Blob..." : "Upload + Process"}
               </button>
               <p className="mt-3 text-xs text-white/50">{storageMessage}</p>
-              <p className="mt-1 text-xs text-white/40">Videos are stored in Vercel Blob and only URLs/metadata are saved in this browser. They are never committed to GitHub.</p>
+              <p className="mt-1 text-xs text-white/40">Videos are stored in Vercel Blob and only URLs/metadata are saved in this browser. During upload, the app uses the local file for instant preview so playback starts faster.</p>
             </div>
 
             <div className="rounded-2xl bg-white/10 p-5 shadow-xl ring-1 ring-white/10">
@@ -504,7 +561,7 @@ export default function Home() {
                 {matches.map((m) => (
                   <div key={m.id} className={`rounded-xl p-3 ${selected?.id === m.id ? "bg-cyan-400 text-slate-950" : "bg-white/10"}`}>
                     <button onClick={() => setSelected(m)} className="w-full text-left font-bold">{m.title}</button>
-                    <p className="text-sm opacity-80">{m.status} · {m.rallies.length} rallies · {bytesToSize(m.file_size)}</p>
+                    <p className="text-sm opacity-80">{m.status} · {m.rallies.length} rallies · {bytesToSize(m.file_size)}</p>{typeof m.upload_progress === "number" && m.upload_progress > 0 && m.upload_progress < 100 && <div className="mt-2 h-2 overflow-hidden rounded-full bg-white/20"><div className="h-full bg-cyan-300" style={{ width: `${m.upload_progress}%` }} /></div>}
                     <button onClick={() => deleteMatch(m)} className="mt-2 rounded bg-red-500/80 px-3 py-1 text-xs font-bold text-white hover:bg-red-500">Delete cloud video</button>
                   </div>
                 ))}
@@ -526,7 +583,7 @@ export default function Home() {
                       {playbackMode !== "normal" && <button onClick={() => setPlaybackMode("normal")} className="rounded-xl bg-white/15 px-4 py-2 font-bold hover:bg-white/25">Stop smart playback</button>}
                     </div>
                   </div>
-                  <video ref={videoRef} className="mt-5 w-full rounded-xl bg-black" controls src={selected.video_url} />
+                  <video ref={videoRef} className="mt-5 w-full rounded-xl bg-black" controls playsInline preload="metadata" src={selected.local_preview_url || selected.video_url} />
                   <div className="mt-4 rounded-xl bg-slate-950/50 p-4 ring-1 ring-white/10">
                     <div className="text-sm uppercase tracking-widest text-cyan-200">Live tracker · {formatTime(currentTime)}</div>
                     <div className="mt-2 text-2xl font-black">{activeTouch ? `${activeTouch.action}: ${activeTouch.player}` : "No active touch yet"}</div>

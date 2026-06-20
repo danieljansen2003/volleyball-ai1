@@ -1,42 +1,33 @@
-# VolleyVision AI - Vercel Blob Upload Build
+# VolleyVision AI - Vercel Blob Fast Upload Build
 
-This version uploads full match videos to **Vercel Blob** instead of browser IndexedDB or local backend storage.
+This version uploads match videos to Vercel Blob and improves the upload/playback experience:
 
-## What changed
-
-- Videos upload directly from the browser to Vercel Blob using `@vercel/blob/client`.
-- The app saves only match metadata and the Blob video URL in browser localStorage.
-- Videos are not committed to GitHub and are not included in Vercel builds.
-- Added API routes:
-  - `apps/web/app/api/blob-upload/route.ts`
-  - `apps/web/app/api/blob-delete/route.ts`
-- Added `.npmrc` files to force the public npm registry.
-- Removed package-lock files so you can regenerate a clean lockfile locally.
+- Uses the selected local file for instant playback while the cloud upload runs.
+- Tracks real upload progress from `@vercel/blob/client`.
+- Shows upload speed and uploaded/total bytes.
+- Keeps cloud URL metadata only in browser localStorage.
+- Keeps videos out of GitHub and Vercel builds.
+- Uses `preload="metadata"` so remote Blob videos start loading metadata instead of trying to load the full file.
 
 ## Required Vercel setup
 
-1. Create/connect a Vercel Blob store to the Vercel project.
-2. Make sure the project has `BLOB_READ_WRITE_TOKEN` in Environment Variables.
-3. Redeploy with existing build cache disabled.
+Your Vercel project must have these environment variables:
 
-## Local setup
+- `BLOB_READ_WRITE_TOKEN`
+- `BLOB_STORE_ID`
+- `BLOB_WEBHOOK_PUBLIC_KEY`
 
-```bash
-cd apps/web
+When connecting Blob storage, check **Add a read-write token env var to this connection**.
+
+## Deploy
+
+```powershell
+cd apps\web
 npm install --registry=https://registry.npmjs.org/
-npm run dev
-```
-
-## Push steps
-
-```bash
+cd ..\..
 git add .
-git commit -m "Add Vercel Blob video uploads"
+git commit -m "Improve Blob upload progress and playback"
 git push
 ```
 
-Then redeploy on Vercel with **Use Existing Build Cache** turned off.
-
-## Note
-
-The current AI event detection is still a browser-side estimator. Real action/player recognition requires a separate backend worker with CV models.
+Redeploy on Vercel after pushing.
