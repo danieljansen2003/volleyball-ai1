@@ -1,7 +1,11 @@
-from fastapi import FastAPI
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from app.pipeline.rally_detector import MODEL_VERSION, build_rallies
+from app.player_tracker import PlayerTracker
 from app.schemas import AnalyzeRequest, AnalyzeResponse
 
 app = FastAPI(title="VolleyVision AI Worker", version="0.1.0")
@@ -14,10 +18,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+player_tracker = PlayerTracker()
+
+
+class TrackRequest(BaseModel):
+    video_path: str
+
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "volleyvision-ai-worker", "model_version": MODEL_VERSION}
+    return {
+        "ok": True,
+        "service": "volleyvision-ai-worker",
+        "model_version": MODEL_VERSION,
+    }
+
+
+@app.post("/track")
+def track_players(req: TrackRequest):
+    try:
+        path = Path(req.video_path).expanduser().resolve()
+
+        if not path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Video not found: {path}",
+            )
+
+        return player_tracker.track(str(path))
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Player tracking failed: {exc}",
+        ) from exc
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -28,6 +64,7 @@ def analyze(req: AnalyzeRequest):
         duration_seconds=req.duration_seconds,
         first_serve_seconds=req.first_serve_seconds,
     )
+
     return AnalyzeResponse(
         status="complete",
         message=message,

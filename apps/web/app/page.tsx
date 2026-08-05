@@ -2,6 +2,7 @@
 
 import { upload as uploadToBlob } from "@vercel/blob/client";
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { MouseEvent, PointerEvent } from "react";
 
 type Touch = {
   id: number;
@@ -26,6 +27,18 @@ type Rally = {
   touches: Touch[];
 };
 
+
+type CourtPoint = {
+  x: number;
+  y: number;
+};
+
+type CourtCalibration = {
+  points: CourtPoint[];
+  confirmed: boolean;
+  frame_time: number;
+};
+
 type Match = {
   id: number;
   title: string;
@@ -40,6 +53,7 @@ type Match = {
   filename: string;
   file_size?: number;
   storage_provider: "vercel-blob";
+  court_calibration?: CourtCalibration;
 };
 
 type RosterPlayer = {
@@ -190,6 +204,7 @@ export default function Home() {
   const activeRowRef = useRef<HTMLTableRowElement | null>(null);
   const uploadStartedAtRef = useRef<number>(0);
   const localPreviewUrlsRef = useRef<string[]>([]);
+  const draggingCornerRef = useRef<number | null>(null);
   const [matches, setMatches] = useState<Match[]>([]);
   const [libraryReady, setLibraryReady] = useState(false);
   const [storageMessage, setStorageMessage] = useState("Videos upload to Vercel Blob and stay out of Git.");
@@ -203,6 +218,9 @@ export default function Home() {
   const [uploadSpeed, setUploadSpeed] = useState("");
   const [analyzeStatus, setAnalyzeStatus] = useState("AI worker not run yet");
   const [analyzing, setAnalyzing] = useState(false);
+  const [courtPoints, setCourtPoints] = useState<CourtPoint[]>([]);
+  const [courtCalibrationMode, setCourtCalibrationMode] = useState(false);
+  const [courtConfirmed, setCourtConfirmed] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [currentTouchId, setCurrentTouchId] = useState<number | null>(null);
   const [currentRallyId, setCurrentRallyId] = useState<number | null>(null);
@@ -254,6 +272,13 @@ export default function Home() {
     };
   }, []);
 
+  useEffect(() => {
+    setCourtPoints(selected?.court_calibration?.points || []);
+    setCourtConfirmed(Boolean(selected?.court_calibration?.confirmed));
+    setCourtCalibrationMode(false);
+    draggingCornerRef.current = null;
+  }, [selected?.id]);
+
   const sortedRallies = useMemo(() => [...(selected?.rallies || [])].sort((a, b) => a.start_time - b.start_time), [selected]);
   const allTouches = useMemo(
     () => sortedRallies.flatMap((r) => r.touches.map((t) => ({ ...t, rally: r }))).sort((a, b) => a.start_time - b.start_time),
@@ -287,118 +312,279 @@ export default function Home() {
     }
   }
 
+  function beginCourtCalibration() {
+    if (!selected || !videoRef.current) return;
+    videoRef.current.pause();
+    setPlaybackMode("normal");
+    setCourtCalibrationMode(true);
+    setCourtConfirmed(false);
+    setCourtPoints([]);
+    draggingCornerRef.current = null;
+  }
+
+  function resetCourtCalibration() {
+    setCourtPoints([]);
+    setCourtConfirmed(false);
+    setCourtCalibrationMode(true);
+    draggingCornerRef.current = null;
+  }
+
+  function normalizedPointFromPointer(
+    event: MouseEvent<HTMLDivElement> | PointerEvent<SVGCircleElement>,
+    element: HTMLElement | SVGElement,
+  ): CourtPoint {
+    const rect = element.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width))),
+      y: Math.max(0, Math.min(1, (event.clientY - rect.top) / Math.max(1, rect.height))),
+    };
+  }
+
+  function addCourtCorner(event: MouseEvent<HTMLDivElement>) {
+    if (!courtCalibrationMode || courtPoints.length >= 4) return;
+    const point = normalizedPointFromPointer(event, event.currentTarget);
+    setCourtPoints((points) => [...points, point]);
+  }
+
+  function startCornerDrag(index: number, event: PointerEvent<SVGCircleElement>) {
+    if (!courtCalibrationMode) return;
+    event.preventDefault();
+    event.stopPropagation();
+    draggingCornerRef.current = index;
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function dragCorner(index: number, event: PointerEvent<SVGCircleElement>) {
+    if (!courtCalibrationMode || draggingCornerRef.current !== index) return;
+    const svg = event.currentTarget.ownerSVGElement;
+    if (!svg) return;
+    const point = normalizedPointFromPointer(event, svg);
+    setCourtPoints((points) => points.map((existing, pointIndex) => (pointIndex === index ? point : existing)));
+  }
+
+  function stopCornerDrag(event: PointerEvent<SVGCircleElement>) {
+    draggingCornerRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  function confirmCourtCalibration() {
+    if (!selected || courtPoints.length !== 4) {
+      return alert("Select all four court corners before confirming.");
+    }
+
+    const calibration: CourtCalibration = {
+      points: courtPoints,
+      confirmed: true,
+      frame_time: videoRef.current?.currentTime || currentTime,
+    };
+    const updated = { ...selected, court_calibration: calibration };
+
+    setSelected(updated);
+    setMatches((previous) => previous.map((match) => (match.id === selected.id ? updated : match)));
+    setCourtConfirmed(true);
+    setCourtCalibrationMode(false);
+    draggingCornerRef.current = null;
+  }
+
   async function upload() {
-    if (!file) return alert("Choose a video first.");
+    if (!file) {
+      alert("Choose a video first.");
+      return;
+    }
+
     if (file.size > MAX_CLIENT_UPLOAD_BYTES) {
-      return alert(`This file is ${bytesToSize(file.size)}. This app guard is set to ${bytesToSize(MAX_CLIENT_UPLOAD_BYTES)}. Compress the file or raise the limit if your Vercel Blob plan supports it.`);
+      alert(
+        `This file is ${bytesToSize(file.size)}. The current limit is ${bytesToSize(
+          MAX_CLIENT_UPLOAD_BYTES,
+        )}.`,
+      );
+      return;
     }
 
     setLoading(true);
     setUploadProgress(0);
     setUploadSpeed("");
-    setUploadStatus("Preparing instant local preview...");
+    setUploadStatus("Preparing local video preview...");
     setPlaybackMode("normal");
 
     const matchId = Date.now();
     const safeName = file.name.replace(/[^a-zA-Z0-9_.-]/g, "_");
     const pathname = `matches/${matchId}-${safeName}`;
-    const localPreviewUrl = URL.createObjectURL(file);
-    localPreviewUrlsRef.current.push(localPreviewUrl);
-
-    const probe = document.createElement("video");
-    probe.preload = "metadata";
-    probe.muted = true;
-    probe.src = localPreviewUrl;
-
-    const readMetadata = new Promise<number>((resolve) => {
-      const done = () => resolve(Number.isFinite(probe.duration) ? probe.duration : 0);
-      probe.onloadedmetadata = done;
-      probe.onerror = () => resolve(0);
-      setTimeout(() => resolve(0), 2500);
-    });
-
-    const guessedDuration = file.size > 4 * 1024 * 1024 * 1024 ? 90 * 60 : 60 * 60;
-    const instantMatch: Match = {
-      id: matchId,
-      title,
-      opponent,
-      status: "uploading to Vercel Blob",
-      duration_seconds: guessedDuration,
-      created_at: new Date().toISOString(),
-      rallies: makeRallies(guessedDuration, matchId, roster),
-      video_url: localPreviewUrl,
-      local_preview_url: localPreviewUrl,
-      upload_progress: 0,
-      filename: file.name,
-      file_size: file.size,
-      storage_provider: "vercel-blob",
-    };
-
-    setMatches((prev) => [instantMatch, ...prev].slice(0, MAX_METADATA_MATCHES));
-    setSelected(instantMatch);
+    let localPreviewUrl = "";
 
     try {
-      const duration = await readMetadata;
-      if (duration > 0) {
-        const withRealDuration = {
-          ...instantMatch,
-          duration_seconds: duration,
-          rallies: makeRallies(duration, matchId, roster),
+      localPreviewUrl = URL.createObjectURL(file);
+      localPreviewUrlsRef.current.push(localPreviewUrl);
+
+      const probe = document.createElement("video");
+      probe.preload = "metadata";
+      probe.muted = true;
+      probe.src = localPreviewUrl;
+
+      const duration = await new Promise<number>((resolve) => {
+        let finished = false;
+
+        const complete = (value: number) => {
+          if (finished) return;
+          finished = true;
+          resolve(value);
         };
-        setSelected(withRealDuration);
-        setMatches((prev) => prev.map((m) => (m.id === matchId ? withRealDuration : m)));
-      }
 
-      uploadStartedAtRef.current = Date.now();
-      setUploadStatus("Uploading full match to Vercel Blob...");
-
-      const blob = await uploadToBlob(pathname, file, {
-        access: "public",
-        handleUploadUrl: "/api/blob-upload",
-        onUploadProgress: (event) => {
-          const loaded = event.loaded || 0;
-          const total = event.total || file.size || 1;
-          const pct = typeof event.percentage === "number" ? event.percentage : Math.round((loaded / Math.max(1, total)) * 100);
-          const elapsed = Math.max(1, (Date.now() - uploadStartedAtRef.current) / 1000);
-          const mbps = loaded / 1024 / 1024 / elapsed;
-          setUploadProgress(Math.max(1, Math.min(99, pct)));
-          setUploadSpeed(`${mbps.toFixed(1)} MB/s · ${bytesToSize(loaded)} / ${bytesToSize(total)}`);
-          setMatches((prev) =>
-            prev.map((m) =>
-              m.id === matchId
-                ? { ...m, status: `uploading ${Math.max(1, Math.min(99, pct))}%`, upload_progress: Math.max(1, Math.min(99, pct)) }
-                : m,
-            ),
-          );
-        },
+        probe.onloadedmetadata = () => {
+          complete(Number.isFinite(probe.duration) ? probe.duration : 0);
+        };
+        probe.onerror = () => complete(0);
+        window.setTimeout(() => complete(0), 3000);
       });
 
-      setUploadProgress(100);
-      setUploadStatus("Upload complete. Cloud video is ready.");
-      const finalized = {
-        ...(matches.find((m) => m.id === matchId) || instantMatch),
-        status: "saved to Vercel Blob",
-        video_url: blob.url,
+      const safeDuration =
+        duration > 0
+          ? duration
+          : file.size > 4 * 1024 * 1024 * 1024
+            ? 90 * 60
+            : 60 * 60;
+
+      const localMatch: Match = {
+        id: matchId,
+        title,
+        opponent,
+        status: "local preview ready",
+        duration_seconds: safeDuration,
+        created_at: new Date().toISOString(),
+        rallies: makeRallies(safeDuration, matchId, roster),
+        video_url: localPreviewUrl,
         local_preview_url: localPreviewUrl,
-        upload_progress: 100,
+        upload_progress: 0,
+        filename: file.name,
+        file_size: file.size,
+        storage_provider: "vercel-blob",
       };
-      setSelected((current) => (current?.id === matchId ? finalized : current));
-      setMatches((prev) => prev.map((m) => (m.id === matchId ? finalized : m)));
-    } catch (err) {
-      console.error(err);
-      setUploadStatus("Upload failed");
+
+      setMatches((previous) =>
+        [localMatch, ...previous].slice(0, MAX_METADATA_MATCHES),
+      );
+      setSelected(localMatch);
+      setCourtPoints([]);
+      setCourtConfirmed(false);
+      setCourtCalibrationMode(false);
+
+      setUploadStatus("Local preview ready. Starting cloud upload...");
+      uploadStartedAtRef.current = Date.now();
+
+      try {
+        const blob = await uploadToBlob(pathname, file, {
+          access: "public",
+          handleUploadUrl: "/api/blob-upload",
+          onUploadProgress: (event) => {
+            const loaded = event.loaded || 0;
+            const total = event.total || file.size || 1;
+            const percentage =
+              typeof event.percentage === "number"
+                ? event.percentage
+                : Math.round((loaded / Math.max(1, total)) * 100);
+            const safePercentage = Math.max(
+              1,
+              Math.min(99, Math.round(percentage)),
+            );
+            const elapsedSeconds = Math.max(
+              1,
+              (Date.now() - uploadStartedAtRef.current) / 1000,
+            );
+            const megabytesPerSecond =
+              loaded / 1024 / 1024 / elapsedSeconds;
+
+            setUploadProgress(safePercentage);
+            setUploadSpeed(
+              `${megabytesPerSecond.toFixed(1)} MB/s · ${bytesToSize(
+                loaded,
+              )} / ${bytesToSize(total)}`,
+            );
+            setUploadStatus("Uploading full match to Vercel Blob...");
+
+            setMatches((previous) =>
+              previous.map((match) =>
+                match.id === matchId
+                  ? {
+                      ...match,
+                      status: `uploading ${safePercentage}%`,
+                      upload_progress: safePercentage,
+                    }
+                  : match,
+              ),
+            );
+          },
+        });
+
+        const cloudMatch: Match = {
+          ...localMatch,
+          status: "saved to Vercel Blob",
+          video_url: blob.url,
+          local_preview_url: localPreviewUrl,
+          upload_progress: 100,
+        };
+
+        setUploadProgress(100);
+        setUploadStatus("Upload complete. Cloud video is ready.");
+        setSelected((current) =>
+          current?.id === matchId ? cloudMatch : current,
+        );
+        setMatches((previous) =>
+          previous.map((match) =>
+            match.id === matchId ? cloudMatch : match,
+          ),
+        );
+      } catch (cloudError) {
+        console.error("Cloud upload failed:", cloudError);
+
+        const localOnlyMatch: Match = {
+          ...localMatch,
+          status: "local preview only — cloud upload failed",
+          upload_progress: 0,
+        };
+
+        setSelected((current) =>
+          current?.id === matchId ? localOnlyMatch : current,
+        );
+        setMatches((previous) =>
+          previous.map((match) =>
+            match.id === matchId ? localOnlyMatch : match,
+          ),
+        );
+        setUploadProgress(0);
+        setUploadSpeed("");
+        setUploadStatus(
+          "Cloud upload failed, but the local preview is ready.",
+        );
+      }
+    } catch (error) {
+      console.error("Could not prepare video:", error);
+
+      if (localPreviewUrl) {
+        URL.revokeObjectURL(localPreviewUrl);
+        localPreviewUrlsRef.current = localPreviewUrlsRef.current.filter(
+          (url) => url !== localPreviewUrl,
+        );
+      }
+
+      setUploadStatus("Could not open the selected video.");
       setUploadProgress(0);
       setUploadSpeed("");
-      setMatches((prev) => prev.filter((m) => m.id !== matchId));
-      setSelected((current) => (current?.id === matchId ? null : current));
-      alert("Cloud upload failed. Confirm BLOB_READ_WRITE_TOKEN is connected to the Vercel project, redeploy, and try again. For very large files, keep the tab open during upload.");
+      alert(
+        error instanceof Error
+          ? `Could not open the video: ${error.message}`
+          : "Could not open the selected video.",
+      );
     } finally {
       setLoading(false);
     }
   }
 
-
   async function runAiWorker(match: Match, firstServeSeconds = currentTime) {
+    if (!match.court_calibration?.confirmed || match.court_calibration.points.length !== 4) {
+      return alert("Set and confirm the four court corners before running the AI worker.");
+    }
     if (!match.video_url || match.video_url.startsWith("blob:")) {
       return alert("Wait until the Vercel Blob upload finishes before running AI worker analysis.");
     }
@@ -416,6 +602,8 @@ export default function Home() {
           video_url: match.video_url,
           duration_seconds: match.duration_seconds,
           first_serve_seconds: firstServeSeconds,
+          court_points: match.court_calibration.points,
+          court_frame_time: match.court_calibration.frame_time,
         }),
       });
       const data = await response.json();
@@ -621,15 +809,70 @@ export default function Home() {
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div><h2 className="text-2xl font-black">{selected.title}</h2><p className="text-white/70">vs {selected.opponent} · {formatTime(selected.duration_seconds)} · {selected.status}</p></div>
                     <div className="flex flex-wrap gap-2">
-                      <button disabled={analyzing || selected.video_url.startsWith("blob:")} onClick={() => runAiWorker(selected, currentTime)} className="rounded-xl bg-purple-400 px-4 py-2 font-bold text-slate-950 hover:bg-purple-300 disabled:opacity-50">{analyzing ? "AI analyzing..." : "Run AI worker from current time"}</button>
+                      <button onClick={beginCourtCalibration} className="rounded-xl bg-amber-300 px-4 py-2 font-bold text-slate-950 hover:bg-amber-200">{courtConfirmed ? "Edit court" : "Set court"}</button>
+                      <button disabled={analyzing || selected.video_url.startsWith("blob:") || !courtConfirmed} onClick={() => runAiWorker(selected, currentTime)} className="rounded-xl bg-purple-400 px-4 py-2 font-bold text-slate-950 hover:bg-purple-300 disabled:opacity-50">{analyzing ? "AI analyzing..." : "Run AI worker from current time"}</button>
                       <button disabled={!top5Rallies.length} onClick={() => playPlaylist(top5Rallies, "top5")} className="rounded-xl bg-cyan-400 px-4 py-2 font-bold text-slate-950 hover:bg-cyan-300 disabled:opacity-50">Preview top 5 rallies</button>
                       <button disabled={!sortedRallies.length} onClick={() => playPlaylist(sortedRallies, "rally-only")} className="rounded-xl bg-green-400 px-4 py-2 font-bold text-slate-950 hover:bg-green-300 disabled:opacity-50">Play rally-only</button>
                       {playbackMode !== "normal" && <button onClick={() => setPlaybackMode("normal")} className="rounded-xl bg-white/15 px-4 py-2 font-bold hover:bg-white/25">Stop smart playback</button>}
                     </div>
                   </div>
-                  <video ref={videoRef} className="mt-5 w-full rounded-xl bg-black" controls playsInline preload="metadata" src={selected.local_preview_url || selected.video_url} />
+                  <div className="relative mt-5 overflow-hidden rounded-xl bg-black">
+                    <video ref={videoRef} className="block w-full bg-black" controls={!courtCalibrationMode} playsInline preload="metadata" src={selected.local_preview_url || selected.video_url} />
+                    {(courtCalibrationMode || courtPoints.length > 0) && (
+                      <div
+                        className={`absolute inset-0 ${courtCalibrationMode ? "cursor-crosshair" : "pointer-events-none"}`}
+                        onClick={addCourtCorner}
+                      >
+                        <svg className="h-full w-full" viewBox="0 0 1 1" preserveAspectRatio="none">
+                          {courtPoints.length >= 2 && (
+                            <polyline
+                              points={[...courtPoints, ...(courtPoints.length === 4 ? [courtPoints[0]] : [])].map((point) => `${point.x},${point.y}`).join(" ")}
+                              fill={courtPoints.length === 4 ? "rgba(34,211,238,0.14)" : "none"}
+                              stroke="rgb(34,211,238)"
+                              strokeWidth="0.006"
+                              vectorEffect="non-scaling-stroke"
+                            />
+                          )}
+                          {courtPoints.map((point, index) => (
+                            <g key={`${index}-${point.x}-${point.y}`}>
+                              <circle
+                                cx={point.x}
+                                cy={point.y}
+                                r="0.018"
+                                fill="rgb(250,204,21)"
+                                stroke="white"
+                                strokeWidth="0.004"
+                                vectorEffect="non-scaling-stroke"
+                                className={courtCalibrationMode ? "cursor-grab active:cursor-grabbing" : ""}
+                                onClick={(event) => event.stopPropagation()}
+                                onPointerDown={(event) => startCornerDrag(index, event)}
+                                onPointerMove={(event) => dragCorner(index, event)}
+                                onPointerUp={stopCornerDrag}
+                                onPointerCancel={stopCornerDrag}
+                              />
+                              <text x={point.x} y={point.y - 0.028} textAnchor="middle" fill="white" fontSize="0.035" fontWeight="800">{index + 1}</text>
+                            </g>
+                          ))}
+                        </svg>
+                      </div>
+                    )}
+                  </div>
+                  {courtCalibrationMode && (
+                    <div className="mt-3 rounded-xl bg-amber-950/50 p-4 ring-1 ring-amber-300/30">
+                      <div className="font-bold text-amber-100">Court calibration · {courtPoints.length}/4 corners selected</div>
+                      <p className="mt-1 text-sm text-amber-100/75">Click the four outer court corners in order around the court. After four clicks, drag any numbered point to adjust it.</p>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button onClick={resetCourtCalibration} className="rounded-lg bg-white/15 px-3 py-2 text-sm font-bold hover:bg-white/25">Reset corners</button>
+                        <button onClick={() => { setCourtCalibrationMode(false); setCourtPoints(selected.court_calibration?.points || []); setCourtConfirmed(Boolean(selected.court_calibration?.confirmed)); }} className="rounded-lg bg-white/15 px-3 py-2 text-sm font-bold hover:bg-white/25">Cancel</button>
+                        <button disabled={courtPoints.length !== 4} onClick={confirmCourtCalibration} className="rounded-lg bg-cyan-300 px-3 py-2 text-sm font-bold text-slate-950 hover:bg-cyan-200 disabled:opacity-40">Confirm court</button>
+                      </div>
+                    </div>
+                  )}
+                  {!courtCalibrationMode && courtConfirmed && (
+                    <p className="mt-2 text-sm font-semibold text-cyan-200">Court calibrated. The four normalized corner points will be sent with AI analysis.</p>
+                  )}
                   <div className="mt-3 rounded-xl bg-purple-950/40 p-3 text-sm text-purple-100 ring-1 ring-purple-300/20">
-                    <strong>AI worker:</strong> {analyzeStatus}. Scrub to the first real serve, then click <strong>Run AI worker from current time</strong>. The starter worker detects likely live rallies only; pass/set/attack labels should come from your trained action model later.
+                    <strong>AI worker:</strong> {analyzeStatus}. First set and confirm the four court corners. Then scrub to the first real serve and click <strong>Run AI worker from current time</strong>. The court points are saved with the match and sent as normalized coordinates.
                   </div>
                   <div className="mt-4 rounded-xl bg-slate-950/50 p-4 ring-1 ring-white/10">
                     <div className="text-sm uppercase tracking-widest text-cyan-200">Live tracker · {formatTime(currentTime)}</div>
