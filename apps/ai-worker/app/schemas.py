@@ -1,5 +1,11 @@
+from typing import Any, List, Optional
+
 from pydantic import BaseModel, Field
-from typing import List, Optional
+
+
+class CourtPoint(BaseModel):
+    x: float = Field(ge=0, le=1)
+    y: float = Field(ge=0, le=1)
 
 
 class AnalyzeRequest(BaseModel):
@@ -9,6 +15,16 @@ class AnalyzeRequest(BaseModel):
     video_url: str
     duration_seconds: float = 0
     first_serve_seconds: Optional[float] = None
+
+    # Four normalized court points selected by the user.
+    # Expected order:
+    # 1. near-left
+    # 2. near-right
+    # 3. far-right
+    # 4. far-left
+    court_points: Optional[List[CourtPoint]] = None
+
+    court_frame_time: Optional[float] = None
 
 
 class Touch(BaseModel):
@@ -39,3 +55,6 @@ class AnalyzeResponse(BaseModel):
     message: str
     rallies: List[Rally]
     model_version: str
+
+    # Real player-tracking output.
+    tracking: Optional[dict[str, Any]] = None
