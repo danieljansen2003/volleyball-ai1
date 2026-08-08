@@ -39,11 +39,15 @@ type StoredJob = {
   error: string | null;
   payload: unknown;
   result_chunk_count?: number;
+  result_url?: string | null;
   worker?: string | null;
 };
 
 async function readBlobJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { cache: "no-store" });
+  // Overwritten Blob URLs can be cached at the CDN. Add a cache-buster so
+  // status reads always see the newest small job document.
+  const separator = url.includes("?") ? "&" : "?";
+  const response = await fetch(`${url}${separator}vv=${Date.now()}`, { cache: "no-store" });
   if (!response.ok) throw new Error(`Could not read blob (${response.status}).`);
   return (await response.json()) as T;
 }
@@ -71,7 +75,10 @@ async function saveJob(job: StoredJob): Promise<void> {
 
 async function publicJob(job: StoredJob) {
   let result: unknown = null;
-  if (job.status === "complete" && (job.result_chunk_count || 0) > 0) {
+  if (job.status === "complete" && job.result_url) {
+    result = await readBlobJson<unknown>(job.result_url);
+  } else if (job.status === "complete" && (job.result_chunk_count || 0) > 0) {
+    // Backward compatibility with jobs created by the earlier chunked worker.
     const prefix = `${RESULT_PREFIX}${job.job_id}/`;
     const chunks = await list({ prefix, limit: 1000 });
     const ordered = chunks.blobs
@@ -204,6 +211,32 @@ export async function PATCH(request: Request): Promise<Response> {
     job.status = "processing";
     job.progress = Math.max(0, Math.min(99, Number(body?.progress || 0)));
     job.message = String(body?.message || "Processing locally");
+  } else if (action === "complete_result") {
+    // Low-traffic local-worker path: upload the entire compact result once.
+    // A typical short VolleyVision result is well below Vercel's request limit.
+    const result = body?.result;
+    if (!result || typeof result !== "object") {
+      return Response.json({ error: "A result object is required." }, { status: 400 });
+    }
+    const serialized = JSON.stringify(result);
+    if (serialized.length > 3_500_000) {
+      return Response.json(
+        { error: "AI result is too large for single-request upload." },
+        { status: 413 },
+      );
+    }
+    const resultBlob = await put(`${RESULT_PREFIX}${jobId}.json`, serialized, {
+      access: "public",
+      contentType: "application/json",
+      addRandomSuffix: false,
+      allowOverwrite: true,
+    });
+    job.result_url = resultBlob.url;
+    job.status = "complete";
+    job.progress = 100;
+    job.message = String(body?.message || "Local AI analysis complete");
+    job.model_version = String(body?.model_version || job.model_version);
+    job.error = null;
   } else if (action === "result_chunk") {
     const index = Number(body?.index);
     const total = Number(body?.total);

@@ -24,61 +24,8 @@ load_dotenv(PROJECT_ROOT / ".env.local-worker")
 from app.main import MODEL_VERSION, _run_analysis  # noqa: E402
 from app.schemas import AnalyzeRequest  # noqa: E402
 
-CHUNK_CHARS = 220_000
-
-
-def normalize_url(value: str) -> str:
-    return value.rstrip("/")
-
-
-def headers(token: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-
-def patch(base: str, token: str, payload: dict[str, Any], timeout: int = 45) -> dict[str, Any]:
-    response = requests.patch(
-        f"{base}/api/analyze",
-        headers=headers(token),
-        json=payload,
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-def next_job(base: str, token: str) -> dict[str, Any] | None:
-    response = requests.get(
-        f"{base}/api/analyze?worker=1",
-        headers=headers(token),
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json()
-    return data.get("job")
-
-
-def upload_result(base: str, token: str, job_id: str, result: dict[str, Any]) -> None:
-    serialized = json.dumps(result, separators=(",", ":"), ensure_ascii=False)
-    chunks = [serialized[i : i + CHUNK_CHARS] for i in range(0, len(serialized), CHUNK_CHARS)] or ["{}"]
-    print(f"[local-worker] Uploading result in {len(chunks)} chunk(s)...", flush=True)
-    for index, chunk in enumerate(chunks):
-        patch(
-            base,
-            token,
-            {
-                "action": "result_chunk",
-                "job_id": job_id,
-                "index": index,
-                "total": len(chunks),
-                "data": chunk,
-            },
-            timeout=60,
-        )
-
+# Vercel Blob is used as a durable queue, not as a live telemetry bus.
+# Keep network writes extremely low: claim once and upload the final result once.
 
 def process_job(base: str, token: str, job: dict[str, Any], worker_name: str) -> None:
     job_id = str(job["job_id"])
@@ -88,44 +35,31 @@ def process_job(base: str, token: str, job: dict[str, Any], worker_name: str) ->
 
     patch(base, token, {"action": "claim", "job_id": job_id, "worker": worker_name})
     req = AnalyzeRequest.model_validate(payload)
-    last_sent = {"percent": -1, "time": 0.0}
+    last_printed = {"percent": -1}
 
     def progress(percent: int, message: str) -> None:
-        now = time.monotonic()
-        # Avoid hammering Vercel while still keeping the UI responsive.
-        if percent == last_sent["percent"] and now - last_sent["time"] < 2.0:
+        # Print progress locally, but do not PATCH Vercel for every few frames.
+        # This avoids exhausting/rate-limiting the free Blob-backed status path.
+        if percent == last_printed["percent"]:
             return
-        if percent < 98 and now - last_sent["time"] < 1.0 and percent - last_sent["percent"] < 2:
-            return
-        last_sent["percent"] = percent
-        last_sent["time"] = now
+        last_printed["percent"] = percent
         print(f"[local-worker] {percent:3d}% {message}", flush=True)
-        try:
-            patch(
-                base,
-                token,
-                {
-                    "action": "progress",
-                    "job_id": job_id,
-                    "progress": percent,
-                    "message": message,
-                },
-            )
-        except Exception as exc:
-            print(f"[local-worker] Progress update warning: {exc}", flush=True)
 
     print(f"[local-worker] Processing job {job_id}", flush=True)
     result = _run_analysis(req, progress_hook=progress)
-    upload_result(base, token, job_id, result)
+    serialized_size = len(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    print(f"[local-worker] Uploading final result once ({serialized_size / 1024:.1f} KB)...", flush=True)
     patch(
         base,
         token,
         {
-            "action": "complete",
+            "action": "complete_result",
             "job_id": job_id,
             "message": result.get("message", "Local AI analysis complete"),
             "model_version": result.get("model_version", MODEL_VERSION),
+            "result": result,
         },
+        timeout=120,
     )
     print(f"[local-worker] Job {job_id} complete.\n", flush=True)
 

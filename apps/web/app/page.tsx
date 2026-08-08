@@ -645,10 +645,10 @@ export default function Home() {
     const started = Date.now();
     const maxWaitMs = 2 * 60 * 60 * 1000;
     let consecutivePollErrors = 0;
-    const maxConsecutivePollErrors = 15;
+    const maxConsecutivePollErrors = 12;
 
     while (!pollCancelledRef.current && Date.now() - started < maxWaitMs) {
-      await new Promise((resolve) => window.setTimeout(resolve, 2000));
+      await new Promise((resolve) => window.setTimeout(resolve, 10000));
 
       try {
         // A temporary Safari/network/Vercel polling error must NOT cancel the AI job.
