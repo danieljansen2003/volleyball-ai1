@@ -207,6 +207,8 @@ export default function Home() {
   const [ballLabelSaving, setBallLabelSaving] = useState(false);
   const [ballLabelStatus, setBallLabelStatus] = useState("Pause on a clear frame, draw a tight box around the volleyball, then save it.");
   const [ballTrainingCount, setBallTrainingCount] = useState(0);
+  const [videoDuration, setVideoDuration] = useState(0);
+  const [videoPlaying, setVideoPlaying] = useState(false);
 
   const [tagPlayer, setTagPlayer] = useState("#12");
   const [tagAction, setTagAction] = useState("attack");
@@ -241,6 +243,35 @@ export default function Home() {
       .then((data) => { if (data?.ok) setBallTrainingCount(Number(data.count || 0)); })
       .catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    if (!ballLabelMode) return;
+
+    function handleKeyDown(event: KeyboardEvent) {
+      const target = event.target as HTMLElement | null;
+      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+      const video = videoRef.current;
+      if (!video) return;
+
+      if (event.code === "Space") {
+        event.preventDefault();
+        if (video.paused) void video.play(); else video.pause();
+      } else if (event.code === "ArrowRight") {
+        event.preventDefault();
+        video.pause();
+        const fps = tracking?.fps || 30;
+        video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 1 / fps);
+      } else if (event.code === "ArrowLeft") {
+        event.preventDefault();
+        video.pause();
+        const fps = tracking?.fps || 30;
+        video.currentTime = Math.max(0, video.currentTime - 1 / fps);
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [ballLabelMode, tracking?.fps]);
 
   useEffect(() => {
     if (!libraryReady) return;
@@ -343,6 +374,27 @@ export default function Home() {
     await saveTrainingFeedback(original, corrected);
   }
 
+  function toggleBallLabelPlayback() {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.paused) void video.play(); else video.pause();
+  }
+
+  function seekBallLabelVideo(value: number) {
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = Math.max(0, Math.min(video.duration || value, value));
+  }
+
+  function stepBallLabelFrame(direction: -1 | 1) {
+    const video = videoRef.current;
+    if (!video) return;
+    video.pause();
+    const fps = tracking?.fps || 30;
+    const next = video.currentTime + direction * (1 / fps);
+    video.currentTime = Math.max(0, Math.min(video.duration || next, next));
+  }
+
   function beginBallLabeling() {
     if (!selected || !videoRef.current) return;
     videoRef.current.pause();
@@ -363,6 +415,7 @@ export default function Home() {
 
   function startBallBox(event: React.PointerEvent<HTMLDivElement>) {
     if (!ballLabelMode) return;
+    videoRef.current?.pause();
     event.preventDefault();
     const point = normalizedPointFromElement(event, event.currentTarget);
     ballDragStartRef.current = point;
@@ -796,7 +849,22 @@ export default function Home() {
                   </div>
 
                   <div className="relative mt-5 overflow-hidden rounded-xl bg-black">
-                    <video ref={videoRef} className="block w-full bg-black" controls={!courtCalibrationMode && !ballLabelMode} playsInline preload="metadata" src={selected.local_preview_url || selected.video_url} onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)} />
+                    <video
+                      ref={videoRef}
+                      className="block w-full bg-black"
+                      controls={!courtCalibrationMode && !ballLabelMode}
+                      playsInline
+                      preload="metadata"
+                      src={selected.local_preview_url || selected.video_url}
+                      onLoadedMetadata={(e) => {
+                        setVideoDuration(Number.isFinite(e.currentTarget.duration) ? e.currentTarget.duration : 0);
+                        setCurrentTime(e.currentTarget.currentTime);
+                      }}
+                      onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+                      onPlay={() => setVideoPlaying(true)}
+                      onPause={() => setVideoPlaying(false)}
+                      onEnded={() => setVideoPlaying(false)}
+                    />
 
                     {(courtCalibrationMode || ballLabelMode || courtPoints.length > 0 || currentTrackingFrame) && (
                       <div
@@ -868,10 +936,31 @@ export default function Home() {
                       <div className="flex flex-wrap items-center justify-between gap-3">
                         <div>
                           <div className="font-bold text-yellow-100">Ball training mode · {ballTrainingCount} saved samples</div>
-                          <p className="mt-1 text-sm text-yellow-100/75">Pause on a frame where the ball is visible. Drag a tight box around the volleyball. Save it. Then scrub to another useful frame and repeat.</p>
+                          <p className="mt-1 text-sm text-yellow-100/75">Labeling stays on while you move through the video. Play or scrub to the next useful moment, pause, draw a tight ball box, save, and continue.</p>
                         </div>
                         <a href="/api/ball-labels" target="_blank" className="rounded-lg bg-white/10 px-3 py-2 text-xs font-bold">Dataset index</a>
                       </div>
+
+                      <div className="mt-3 rounded-xl bg-black/20 p-3">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button type="button" onClick={() => stepBallLabelFrame(-1)} className="rounded-lg bg-white/15 px-3 py-2 text-sm font-bold">← 1 frame</button>
+                          <button type="button" onClick={toggleBallLabelPlayback} className="min-w-24 rounded-lg bg-cyan-300 px-4 py-2 text-sm font-bold text-slate-950">{videoPlaying ? "Pause" : "Play"}</button>
+                          <button type="button" onClick={() => stepBallLabelFrame(1)} className="rounded-lg bg-white/15 px-3 py-2 text-sm font-bold">1 frame →</button>
+                          <span className="ml-auto text-sm font-bold text-yellow-100">{formatTime(currentTime)} / {formatTime(videoDuration)}</span>
+                        </div>
+                        <input
+                          aria-label="Ball labeling video position"
+                          type="range"
+                          min={0}
+                          max={Math.max(videoDuration, 0.001)}
+                          step={0.001}
+                          value={Math.min(currentTime, Math.max(videoDuration, 0.001))}
+                          onChange={(event) => seekBallLabelVideo(Number(event.currentTarget.value))}
+                          className="mt-3 w-full accent-yellow-300"
+                        />
+                        <div className="mt-2 text-xs text-yellow-100/65">Shortcuts: Space = play/pause · ←/→ = one frame. Starting a box automatically pauses the video.</div>
+                      </div>
+
                       <p className="mt-3 rounded-lg bg-black/20 p-2 text-sm text-yellow-100">{ballLabelStatus}</p>
                       <div className="mt-3 flex flex-wrap gap-2">
                         <button onClick={() => setBallLabelBox(null)} className="rounded-lg bg-white/15 px-3 py-2 text-sm font-bold">Clear box</button>

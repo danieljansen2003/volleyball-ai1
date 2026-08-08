@@ -68,3 +68,14 @@ Render will load the custom model on startup. `/health` should report `volleyvis
 ## Important
 
 Do not label frames where you cannot confidently locate the ball. Keep boxes tight. Include motion blur, far-side balls, near-player contacts, ceiling/background clutter, and different rally phases.
+
+## Fast labeling controls
+
+Ball labeling mode now stays active while you move through the video. You no longer need to press **Done labeling** between samples.
+
+- **Play / Pause**: custom button or Space
+- **Previous / next frame**: buttons or Left/Right Arrow
+- **Scrub**: use the yellow timeline slider
+- **Draw label**: drag a box around the ball; drawing automatically pauses playback
+- **Save volleyball label**: saves the current frame and box, clears the box, and keeps labeling mode active
+- **Done labeling**: only use this when you are finished with the whole labeling session
