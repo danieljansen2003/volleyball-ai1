@@ -1,4 +1,4 @@
-services:
+vvservices:
   web:
     build: ./apps/web
     ports:
