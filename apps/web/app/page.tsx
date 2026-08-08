@@ -644,37 +644,108 @@ export default function Home() {
     pollCancelledRef.current = false;
     const started = Date.now();
     const maxWaitMs = 2 * 60 * 60 * 1000;
+    let consecutivePollErrors = 0;
+    const maxConsecutivePollErrors = 15;
 
     while (!pollCancelledRef.current && Date.now() - started < maxWaitMs) {
       await new Promise((resolve) => window.setTimeout(resolve, 2000));
-      const response = await fetch(`/api/analyze?job_id=${encodeURIComponent(jobId)}`, { cache: "no-store" });
-      const job: JobResponse & { error?: string } = await response.json();
-      if (!response.ok) throw new Error(job.error || "Could not check AI job.");
 
-      setAnalyzeProgress(job.progress || 0);
-      setAnalyzeStatus(job.message || job.status);
+      try {
+        // A temporary Safari/network/Vercel polling error must NOT cancel the AI job.
+        // The local Mac worker runs independently, so keep reconnecting to the job.
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), 15000);
 
-      if (job.status === "failed") throw new Error(job.error || "AI analysis failed.");
-      if (job.status !== "complete") continue;
+        let response: Response;
+        try {
+          response = await fetch(
+            `/api/analyze?job_id=${encodeURIComponent(jobId)}&poll=${Date.now()}`,
+            {
+              cache: "no-store",
+              signal: controller.signal,
+              headers: { Accept: "application/json" },
+            },
+          );
+        } finally {
+          window.clearTimeout(timeoutId);
+        }
 
-      const result = job.result;
-      if (!result?.tracking) throw new Error("AI job completed without tracking data.");
+        const raw = await response.text();
+        let job: JobResponse & { error?: string };
+        try {
+          job = JSON.parse(raw) as JobResponse & { error?: string };
+        } catch {
+          throw new Error(
+            `Status check returned non-JSON data (HTTP ${response.status}).`,
+          );
+        }
 
-      setTracking(result.tracking);
-      const updated: Match = {
-        ...match,
-        status: `AI analyzed: ${result.model_version}`,
-        rallies: result.rallies || [],
-        tracking_summary: trackingSummary(result.tracking),
-      };
-      updateMatch(updated);
-      setAnalyzeProgress(100);
-      setAnalyzeStatus(result.message || "AI tracking complete.");
-      const candidateCount = result.action_diagnostics?.contact_candidates ?? result.rallies?.flatMap((rally) => rally.touches).length ?? 0;
-      setFeedbackStatus(candidateCount ? `AI proposed ${candidateCount} action candidate${candidateCount === 1 ? "" : "s"}. Review and approve/correct them below.` : (result.action_diagnostics?.message || "No action candidates found. Manual labels are still useful training data."));
-      return;
+        if (!response.ok) {
+          throw new Error(job.error || `Could not check AI job (HTTP ${response.status}).`);
+        }
+
+        consecutivePollErrors = 0;
+        setAnalyzeProgress(job.progress || 0);
+        setAnalyzeStatus(job.message || job.status);
+
+        if (job.status === "failed") {
+          throw new Error(job.error || "AI analysis failed.");
+        }
+        if (job.status !== "complete") continue;
+
+        const result = job.result;
+        if (!result?.tracking) {
+          throw new Error("AI job completed without tracking data.");
+        }
+
+        setTracking(result.tracking);
+        const updated: Match = {
+          ...match,
+          status: `AI analyzed: ${result.model_version}`,
+          rallies: result.rallies || [],
+          tracking_summary: trackingSummary(result.tracking),
+        };
+        updateMatch(updated);
+        setAnalyzeProgress(100);
+        setAnalyzeStatus(result.message || "AI tracking complete.");
+        const candidateCount =
+          result.action_diagnostics?.contact_candidates ??
+          result.rallies?.flatMap((rally) => rally.touches).length ??
+          0;
+        setFeedbackStatus(
+          candidateCount
+            ? `AI proposed ${candidateCount} action candidate${candidateCount === 1 ? "" : "s"}. Review and approve/correct them below.`
+            : result.action_diagnostics?.message ||
+                "No action candidates found. Manual labels are still useful training data.",
+        );
+        return;
+      } catch (error) {
+        // A job that explicitly reports failure is terminal. Browser/network polling
+        // failures are retried because the Mac worker may still be running normally.
+        const message = error instanceof Error ? error.message : "Could not check AI job.";
+        if (message === "AI analysis failed." || message.startsWith("HTTP worker failure:")) {
+          throw error;
+        }
+
+        consecutivePollErrors += 1;
+        console.warn(
+          `AI status poll ${consecutivePollErrors}/${maxConsecutivePollErrors} failed:`,
+          error,
+        );
+
+        if (consecutivePollErrors >= maxConsecutivePollErrors) {
+          throw new Error(
+            "Lost contact with the AI job status endpoint. The Mac worker may still be processing; refresh the page before starting another job.",
+          );
+        }
+
+        setAnalyzeStatus(
+          `AI is still running locally. Reconnecting to status… (${consecutivePollErrors}/${maxConsecutivePollErrors})`,
+        );
+      }
     }
 
+    if (pollCancelledRef.current) return;
     throw new Error("AI job did not finish before the browser polling limit.");
   }
 
