@@ -29,6 +29,7 @@ class PlayerTracker:
         self.tracker_path = str(tracker_path)
         self.person_conf = float(os.getenv("VV_PERSON_CONF", "0.32"))
         self.ball_conf = float(os.getenv("VV_BALL_CONF", "0.08"))
+        self.ball_imgsz = int(os.getenv("VV_BALL_IMGSZ", "1280"))
         self.stitch_gap_seconds = float(os.getenv("VV_STITCH_GAP_SECONDS", "3.0"))
         self.stitch_distance = float(os.getenv("VV_STITCH_DISTANCE", "0.22"))
         print(
@@ -237,6 +238,64 @@ class PlayerTracker:
         for frame_index, result in enumerate(results):
             players: list[dict[str, Any]] = []
             balls: list[dict[str, Any]] = []
+
+            # Run the dedicated volleyball detector on the exact frame that was
+            # used for player tracking. The custom model is single-class, so we
+            # do not use COCO's generic "sports ball" class here.
+            if self.ball_model is not None and result.orig_img is not None:
+                ball_results = self.ball_model.predict(
+                    source=result.orig_img,
+                    conf=self.ball_conf,
+                    imgsz=self.ball_imgsz,
+                    device=self.device,
+                    verbose=False,
+                    max_det=5,
+                )
+
+                if ball_results and ball_results[0].boxes is not None and len(ball_results[0].boxes) > 0:
+                    ball_boxes = ball_results[0].boxes.xyxy.cpu().tolist()
+                    ball_confidences = ball_results[0].boxes.conf.cpu().tolist()
+
+                    candidates: list[dict[str, Any]] = []
+                    for ball_box, ball_confidence in zip(ball_boxes, ball_confidences, strict=True):
+                        bx1, by1, bx2, by2 = (float(value) for value in ball_box)
+                        ball_confidence = float(ball_confidence)
+                        center_x = (bx1 + bx2) / 2.0
+                        center_y = (by1 + by2) / 2.0
+
+                        # Guard against obviously implausible giant boxes. This is
+                        # deliberately permissive because the ball can be very small.
+                        if (bx2 - bx1) > width * 0.15 or (by2 - by1) > height * 0.15:
+                            continue
+
+                        candidates.append(
+                            {
+                                "confidence": round(ball_confidence, 4),
+                                "box": {
+                                    "x1": round(bx1, 2),
+                                    "y1": round(by1, 2),
+                                    "x2": round(bx2, 2),
+                                    "y2": round(by2, 2),
+                                },
+                                "center": {
+                                    "x": round(center_x, 2),
+                                    "y": round(center_y, 2),
+                                },
+                                "center_normalized": {
+                                    "x": round(center_x / max(1, width), 6),
+                                    "y": round(center_y / max(1, height), 6),
+                                },
+                                "source": "custom_volleyball_model",
+                            }
+                        )
+
+                    # There is only one game ball. Keep the strongest detection for
+                    # each frame rather than passing multiple false positives into
+                    # contact/action inference.
+                    if candidates:
+                        best_ball = max(candidates, key=lambda item: float(item["confidence"]))
+                        balls.append(best_ball)
+                        ball_detections += 1
 
             if result.boxes is not None and len(result.boxes) > 0:
                 boxes = result.boxes.xyxy.cpu().tolist()
