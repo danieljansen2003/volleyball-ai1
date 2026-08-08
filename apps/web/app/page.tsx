@@ -4,6 +4,9 @@ import { upload as uploadToBlob } from "@vercel/blob/client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent, PointerEvent } from "react";
 
+type CourtPoint = { x: number; y: number };
+type CourtCalibration = { points: CourtPoint[]; confirmed: boolean; frame_time: number };
+
 type Touch = {
   id: number;
   rally_id: number;
@@ -27,17 +30,49 @@ type Rally = {
   touches: Touch[];
 };
 
-
-type CourtPoint = {
-  x: number;
-  y: number;
+type TrackingPlayer = {
+  track_id: number;
+  confidence: number;
+  box: { x1: number; y1: number; x2: number; y2: number };
+  foot: { x: number; y: number };
 };
 
-type CourtCalibration = {
-  points: CourtPoint[];
-  confirmed: boolean;
-  frame_time: number;
+type TrackingFrame = {
+  frame: number;
+  timestamp_seconds: number;
+  players: TrackingPlayer[];
 };
+
+type TrackingResult = {
+  status: string;
+  device: string;
+  fps: number;
+  width: number;
+  height: number;
+  frame_count: number;
+  reported_frame_count: number;
+  duration_seconds: number;
+  unique_track_count: number;
+  detections_total: number;
+  detections_inside_court: number;
+  detections_removed_outside_court: number;
+  detections_removed_short_track: number;
+  detections_kept: number;
+  track_lengths: Record<string, number>;
+  frames: TrackingFrame[];
+};
+
+type TrackingSummary = Pick<
+  TrackingResult,
+  | "unique_track_count"
+  | "detections_total"
+  | "detections_inside_court"
+  | "detections_removed_outside_court"
+  | "detections_removed_short_track"
+  | "detections_kept"
+  | "frame_count"
+  | "fps"
+>;
 
 type Match = {
   id: number;
@@ -54,21 +89,30 @@ type Match = {
   file_size?: number;
   storage_provider: "vercel-blob";
   court_calibration?: CourtCalibration;
+  tracking_summary?: TrackingSummary;
 };
 
-type RosterPlayer = {
-  number: string;
-  name: string;
-  build: string;
-  role: string;
+type RosterPlayer = { number: string; name: string; build: string; role: string };
+
+type JobResponse = {
+  job_id: string;
+  status: "queued" | "processing" | "complete" | "failed";
+  progress: number;
+  message: string;
+  error?: string | null;
+  result?: {
+    status: string;
+    message: string;
+    model_version: string;
+    rallies: Rally[];
+    tracking?: TrackingResult;
+  } | null;
 };
 
-type PlaybackMode = "normal" | "rally-only" | "top5";
-
-const MATCH_LIBRARY_KEY = "volleyvision-cloud-matches-v1";
+const MATCH_LIBRARY_KEY = "volleyvision-cloud-matches-v2";
 const ROSTER_KEY = "volleyvision-roster-v3";
 const MAX_METADATA_MATCHES = 50;
-const MAX_CLIENT_UPLOAD_BYTES = 25 * 1024 * 1024 * 1024; // App guard. Your Vercel plan/storage limits may be lower.
+const MAX_CLIENT_UPLOAD_BYTES = 25 * 1024 * 1024 * 1024;
 
 function bytesToSize(bytes = 0) {
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
@@ -78,9 +122,7 @@ function bytesToSize(bytes = 0) {
 
 function formatTime(seconds: number) {
   const safe = Math.max(0, Math.floor(seconds));
-  const m = Math.floor(safe / 60);
-  const s = safe % 60;
-  return `${m}:${String(s).padStart(2, "0")}`;
+  return `${Math.floor(safe / 60)}:${String(safe % 60).padStart(2, "0")}`;
 }
 
 function readMatchLibrary(): Match[] {
@@ -99,159 +141,70 @@ function saveMatchLibrary(matches: Match[]) {
   window.localStorage.setItem(MATCH_LIBRARY_KEY, JSON.stringify(persistable));
 }
 
-function playerText(p?: RosterPlayer) {
-  if (!p) return "Unknown";
-  return `#${p.number || "?"} ${p.name || "Player"}`;
-}
-
-function rolePick(roster: RosterPlayer[], role: string, fallbackIndex: number) {
-  if (!roster.length) return undefined;
-  const needle = role.toLowerCase();
-  const hit = roster.find(
-    (p) =>
-      p.role.toLowerCase().includes(needle) ||
-      p.build.toLowerCase().includes(needle),
-  );
-  return hit || roster[fallbackIndex % roster.length];
-}
-
-function makeRallies(duration: number, matchId: number, roster: RosterPlayer[]) {
-  const rallies: Rally[] = [];
-  const phases = [
-    "Serve receive",
-    "Free ball transition",
-    "Out-of-system receive",
-    "Defensive transition",
-    "Sideout receive",
-  ];
-  const results = ["kill", "kept alive", "error", "tip covered", "block touch", "point won"];
-
-  let t = 4;
-  let i = 0;
-  while (t < duration - 5) {
-    const rallyLength = Math.min(9 + (i % 5) * 2.5, Math.max(5, duration - t));
-    const receive = rolePick(roster, "pass", i) || rolePick(roster, "defensive", i) || roster[i % Math.max(1, roster.length)];
-    const setter = rolePick(roster, "setter", i + 1) || roster[(i + 1) % Math.max(1, roster.length)];
-    const attacker = rolePick(roster, "hitter", i + 2) || rolePick(roster, "outside", i + 2) || roster[(i + 2) % Math.max(1, roster.length)];
-    const cover = rolePick(roster, "middle", i + 3) || roster[(i + 3) % Math.max(1, roster.length)];
-    const base = Math.round(t * 10) / 10;
-
-    const touchSpecs = [
-      {
-        off: 0,
-        len: 1.4,
-        action: i % 4 === 0 ? "Serve" : "Serve receive / pass",
-        player: i % 4 === 0 ? attacker : receive,
-        outcome: i % 4 === 0 ? "serve in" : "in-system pass",
-      },
-      {
-        off: Math.min(2.4, rallyLength * 0.25),
-        len: 1.2,
-        action: "Set",
-        player: setter,
-        outcome: "set to pin/middle",
-      },
-      {
-        off: Math.min(4.6, rallyLength * 0.48),
-        len: 1.5,
-        action: "Attack",
-        player: attacker,
-        outcome: results[i % results.length],
-      },
-      {
-        off: Math.min(6.8, rallyLength * 0.68),
-        len: 1.4,
-        action: i % 3 === 0 ? "Block touch" : "Dig / cover",
-        player: cover,
-        outcome: i % 3 === 0 ? "block touch" : "kept alive",
-      },
-    ];
-
-    const touches = touchSpecs
-      .filter((spec) => spec.off < rallyLength - 0.5)
-      .map((spec, j) => ({
-        id: matchId + i * 100 + j,
-        rally_id: matchId + i,
-        start_time: Math.round((base + spec.off) * 10) / 10,
-        end_time: Math.round(Math.min(base + rallyLength, base + spec.off + spec.len) * 10) / 10,
-        action: spec.action,
-        player: playerText(spec.player),
-        outcome: spec.outcome,
-        notes: "Estimated from timing + roster role hints. Future upgrade: YOLO players, jersey OCR, pose tracking, and ball tracking.",
-        confidence: 0.48 + ((i + j) % 5) * 0.07,
-      }));
-
-    rallies.push({
-      id: matchId + i,
-      match_id: matchId,
-      start_time: base,
-      end_time: Math.round((base + rallyLength) * 10) / 10,
-      phase: phases[i % phases.length],
-      result: results[i % results.length],
-      confidence: 0.5 + (i % 4) * 0.08,
-      touches,
-    });
-
-    t += rallyLength + 5 + (i % 4) * 3;
-    i += 1;
-  }
-
-  return rallies;
+function trackingSummary(tracking: TrackingResult): TrackingSummary {
+  return {
+    unique_track_count: tracking.unique_track_count,
+    detections_total: tracking.detections_total,
+    detections_inside_court: tracking.detections_inside_court,
+    detections_removed_outside_court: tracking.detections_removed_outside_court,
+    detections_removed_short_track: tracking.detections_removed_short_track,
+    detections_kept: tracking.detections_kept,
+    frame_count: tracking.frame_count,
+    fps: tracking.fps,
+  };
 }
 
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const activeRowRef = useRef<HTMLTableRowElement | null>(null);
-  const uploadStartedAtRef = useRef<number>(0);
+  const uploadStartedAtRef = useRef(0);
   const localPreviewUrlsRef = useRef<string[]>([]);
   const draggingCornerRef = useRef<number | null>(null);
+  const pollCancelledRef = useRef(false);
+
   const [matches, setMatches] = useState<Match[]>([]);
   const [libraryReady, setLibraryReady] = useState(false);
-  const [storageMessage, setStorageMessage] = useState("Videos upload to Vercel Blob and stay out of Git.");
   const [selected, setSelected] = useState<Match | null>(null);
   const [title, setTitle] = useState("Varsity Match");
   const [opponent, setOpponent] = useState("Opponent");
   const [file, setFile] = useState<File | null>(null);
+  const [storageMessage, setStorageMessage] = useState("Videos upload to Vercel Blob and stay out of Git.");
+
   const [loading, setLoading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadStatus, setUploadStatus] = useState("Idle");
   const [uploadSpeed, setUploadSpeed] = useState("");
-  const [analyzeStatus, setAnalyzeStatus] = useState("AI worker not run yet");
-  const [analyzing, setAnalyzing] = useState(false);
+
   const [courtPoints, setCourtPoints] = useState<CourtPoint[]>([]);
   const [courtCalibrationMode, setCourtCalibrationMode] = useState(false);
   const [courtConfirmed, setCourtConfirmed] = useState(false);
+
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeProgress, setAnalyzeProgress] = useState(0);
+  const [analyzeStatus, setAnalyzeStatus] = useState("AI worker not run yet");
+  const [tracking, setTracking] = useState<TrackingResult | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
-  const [currentTouchId, setCurrentTouchId] = useState<number | null>(null);
-  const [currentRallyId, setCurrentRallyId] = useState<number | null>(null);
-  const [playbackMode, setPlaybackMode] = useState<PlaybackMode>("normal");
-  const [activePlaylist, setActivePlaylist] = useState<Rally[]>([]);
-  const [playlistIndex, setPlaylistIndex] = useState(0);
+
   const [tagPlayer, setTagPlayer] = useState("#12");
   const [tagAction, setTagAction] = useState("attack");
   const [tagOutcome, setTagOutcome] = useState("kill");
   const [roster, setRoster] = useState<RosterPlayer[]>([
-    { number: "8", name: "Player 8", build: "tall outside/right-side build", role: "outside hitter" },
-    { number: "12", name: "Player 12", build: "middle/tall blocker build", role: "middle blocker" },
-    { number: "1", name: "Player 1", build: "setter/defensive build", role: "setter" },
-    { number: "2", name: "Player 2", build: "left-back passer build", role: "passer/libero" },
-    { number: "3", name: "Player 3", build: "right-back defender build", role: "defensive specialist" },
+    { number: "8", name: "Player 8", build: "outside/right-side build", role: "outside hitter" },
+    { number: "12", name: "Player 12", build: "middle blocker build", role: "middle blocker" },
+    { number: "1", name: "Player 1", build: "setter build", role: "setter" },
+    { number: "2", name: "Player 2", build: "passer/libero build", role: "passer/libero" },
+    { number: "3", name: "Player 3", build: "defensive build", role: "defensive specialist" },
     { number: "4", name: "Player 4", build: "outside hitter build", role: "hitter" },
   ]);
 
   useEffect(() => {
     const savedRoster = window.localStorage.getItem(ROSTER_KEY);
-    if (savedRoster) setRoster(JSON.parse(savedRoster));
+    if (savedRoster) {
+      try { setRoster(JSON.parse(savedRoster)); } catch { /* ignore corrupt local data */ }
+    }
     const restored = readMatchLibrary();
     setMatches(restored);
     setSelected(restored[0] || null);
     setLibraryReady(true);
-    const total = restored.reduce((sum, m) => sum + (m.file_size || 0), 0);
-    setStorageMessage(
-      restored.length
-        ? `${restored.length} cloud videos · ${bytesToSize(total)} referenced from Vercel Blob`
-        : "No saved cloud videos yet. Uploads will be stored in Vercel Blob, not browser storage or Git.",
-    );
   }, []);
 
   useEffect(() => {
@@ -261,72 +214,60 @@ export default function Home() {
   useEffect(() => {
     if (!libraryReady) return;
     saveMatchLibrary(matches);
-    const total = matches.reduce((sum, m) => sum + (m.file_size || 0), 0);
+    const total = matches.reduce((sum, match) => sum + (match.file_size || 0), 0);
     setStorageMessage(`${matches.length} cloud videos · ${bytesToSize(total)} referenced from Vercel Blob`);
   }, [matches, libraryReady]);
 
-  useEffect(() => {
-    return () => {
-      localPreviewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-      localPreviewUrlsRef.current = [];
-    };
+  useEffect(() => () => {
+    pollCancelledRef.current = true;
+    localPreviewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
   }, []);
 
   useEffect(() => {
+    pollCancelledRef.current = true;
+    setTracking(null);
+    setAnalyzeProgress(0);
+    setAnalyzeStatus(selected?.tracking_summary ? "Previous tracking summary loaded. Re-run AI to restore video overlay." : "AI worker not run yet");
     setCourtPoints(selected?.court_calibration?.points || []);
     setCourtConfirmed(Boolean(selected?.court_calibration?.confirmed));
     setCourtCalibrationMode(false);
-    draggingCornerRef.current = null;
   }, [selected?.id]);
 
-  const sortedRallies = useMemo(() => [...(selected?.rallies || [])].sort((a, b) => a.start_time - b.start_time), [selected]);
+  const sortedRallies = useMemo(
+    () => [...(selected?.rallies || [])].sort((a, b) => a.start_time - b.start_time),
+    [selected],
+  );
   const allTouches = useMemo(
-    () => sortedRallies.flatMap((r) => r.touches.map((t) => ({ ...t, rally: r }))).sort((a, b) => a.start_time - b.start_time),
+    () => sortedRallies.flatMap((rally) => rally.touches).sort((a, b) => a.start_time - b.start_time),
     [sortedRallies],
   );
-  const top5Rallies = useMemo(() => [...sortedRallies].sort((a, b) => b.confidence - a.confidence).slice(0, 5), [sortedRallies]);
-  const activeTouch = useMemo(
-    () => allTouches.find((t) => currentTime >= t.start_time && currentTime < t.end_time) || allTouches.filter((t) => t.start_time <= currentTime).at(-1) || null,
-    [allTouches, currentTime],
-  );
-  const activeRally = useMemo(
-    () => sortedRallies.find((r) => currentTime >= r.start_time && currentTime < r.end_time) || sortedRallies.filter((r) => r.start_time <= currentTime).at(-1) || null,
-    [sortedRallies, currentTime],
-  );
 
-  useEffect(() => {
-    setCurrentTouchId(activeTouch?.id || null);
-    setCurrentRallyId(activeRally?.id || null);
-  }, [activeTouch, activeRally]);
+  const currentTrackingFrame = useMemo(() => {
+    if (!tracking?.frames.length) return null;
+    const estimatedIndex = Math.round(currentTime * tracking.fps);
+    const clamped = Math.max(0, Math.min(tracking.frames.length - 1, estimatedIndex));
+    return tracking.frames[clamped] || null;
+  }, [tracking, currentTime]);
 
-  useEffect(() => {
-    activeRowRef.current?.scrollIntoView({ block: "center", behavior: "smooth" });
-  }, [currentTouchId]);
-
-  function jumpToTime(seconds: number, autoplay = true) {
-    setPlaybackMode("normal");
-    if (videoRef.current) {
-      videoRef.current.currentTime = Math.max(0, seconds);
-      setCurrentTime(seconds);
-      if (autoplay) videoRef.current.play();
-    }
+  function updateMatch(updated: Match) {
+    setSelected(updated);
+    setMatches((previous) => previous.map((match) => (match.id === updated.id ? updated : match)));
   }
 
   function beginCourtCalibration() {
     if (!selected || !videoRef.current) return;
     videoRef.current.pause();
-    setPlaybackMode("normal");
     setCourtCalibrationMode(true);
     setCourtConfirmed(false);
     setCourtPoints([]);
-    draggingCornerRef.current = null;
+    setTracking(null);
   }
 
   function resetCourtCalibration() {
     setCourtPoints([]);
     setCourtConfirmed(false);
     setCourtCalibrationMode(true);
-    draggingCornerRef.current = null;
+    setTracking(null);
   }
 
   function normalizedPointFromPointer(
@@ -342,8 +283,7 @@ export default function Home() {
 
   function addCourtCorner(event: MouseEvent<HTMLDivElement>) {
     if (!courtCalibrationMode || courtPoints.length >= 4) return;
-    const point = normalizedPointFromPointer(event, event.currentTarget);
-    setCourtPoints((points) => [...points, point]);
+    setCourtPoints((points) => [...points, normalizedPointFromPointer(event, event.currentTarget)]);
   }
 
   function startCornerDrag(index: number, event: PointerEvent<SVGCircleElement>) {
@@ -359,7 +299,7 @@ export default function Home() {
     const svg = event.currentTarget.ownerSVGElement;
     if (!svg) return;
     const point = normalizedPointFromPointer(event, svg);
-    setCourtPoints((points) => points.map((existing, pointIndex) => (pointIndex === index ? point : existing)));
+    setCourtPoints((points) => points.map((current, i) => (i === index ? point : current)));
   }
 
   function stopCornerDrag(event: PointerEvent<SVGCircleElement>) {
@@ -370,44 +310,26 @@ export default function Home() {
   }
 
   function confirmCourtCalibration() {
-    if (!selected || courtPoints.length !== 4) {
-      return alert("Select all four court corners before confirming.");
-    }
-
+    if (!selected || courtPoints.length !== 4) return alert("Select all four court corners first.");
     const calibration: CourtCalibration = {
       points: courtPoints,
       confirmed: true,
       frame_time: videoRef.current?.currentTime || currentTime,
     };
-    const updated = { ...selected, court_calibration: calibration };
-
-    setSelected(updated);
-    setMatches((previous) => previous.map((match) => (match.id === selected.id ? updated : match)));
+    updateMatch({ ...selected, court_calibration: calibration, tracking_summary: undefined });
     setCourtConfirmed(true);
     setCourtCalibrationMode(false);
-    draggingCornerRef.current = null;
+    setTracking(null);
   }
 
   async function upload() {
-    if (!file) {
-      alert("Choose a video first.");
-      return;
-    }
-
-    if (file.size > MAX_CLIENT_UPLOAD_BYTES) {
-      alert(
-        `This file is ${bytesToSize(file.size)}. The current limit is ${bytesToSize(
-          MAX_CLIENT_UPLOAD_BYTES,
-        )}.`,
-      );
-      return;
-    }
+    if (!file) return alert("Choose a video first.");
+    if (file.size > MAX_CLIENT_UPLOAD_BYTES) return alert(`File is too large: ${bytesToSize(file.size)}.`);
 
     setLoading(true);
     setUploadProgress(0);
     setUploadSpeed("");
-    setUploadStatus("Preparing local video preview...");
-    setPlaybackMode("normal");
+    setUploadStatus("Preparing local preview...");
 
     const matchId = Date.now();
     const safeName = file.name.replace(/[^a-zA-Z0-9_.-]/g, "_");
@@ -417,43 +339,25 @@ export default function Home() {
     try {
       localPreviewUrl = URL.createObjectURL(file);
       localPreviewUrlsRef.current.push(localPreviewUrl);
-
       const probe = document.createElement("video");
       probe.preload = "metadata";
-      probe.muted = true;
       probe.src = localPreviewUrl;
-
       const duration = await new Promise<number>((resolve) => {
-        let finished = false;
-
-        const complete = (value: number) => {
-          if (finished) return;
-          finished = true;
-          resolve(value);
-        };
-
-        probe.onloadedmetadata = () => {
-          complete(Number.isFinite(probe.duration) ? probe.duration : 0);
-        };
-        probe.onerror = () => complete(0);
-        window.setTimeout(() => complete(0), 3000);
+        let done = false;
+        const finish = (value: number) => { if (!done) { done = true; resolve(value); } };
+        probe.onloadedmetadata = () => finish(Number.isFinite(probe.duration) ? probe.duration : 0);
+        probe.onerror = () => finish(0);
+        window.setTimeout(() => finish(0), 3000);
       });
-
-      const safeDuration =
-        duration > 0
-          ? duration
-          : file.size > 4 * 1024 * 1024 * 1024
-            ? 90 * 60
-            : 60 * 60;
 
       const localMatch: Match = {
         id: matchId,
         title,
         opponent,
         status: "local preview ready",
-        duration_seconds: safeDuration,
+        duration_seconds: duration > 0 ? duration : 60 * 60,
         created_at: new Date().toISOString(),
-        rallies: makeRallies(safeDuration, matchId, roster),
+        rallies: [],
         video_url: localPreviewUrl,
         local_preview_url: localPreviewUrl,
         upload_progress: 0,
@@ -462,16 +366,14 @@ export default function Home() {
         storage_provider: "vercel-blob",
       };
 
-      setMatches((previous) =>
-        [localMatch, ...previous].slice(0, MAX_METADATA_MATCHES),
-      );
+      setMatches((previous) => [localMatch, ...previous].slice(0, MAX_METADATA_MATCHES));
       setSelected(localMatch);
+      setTracking(null);
       setCourtPoints([]);
       setCourtConfirmed(false);
-      setCourtCalibrationMode(false);
 
-      setUploadStatus("Local preview ready. Starting cloud upload...");
       uploadStartedAtRef.current = Date.now();
+      setUploadStatus("Uploading full match to Vercel Blob...");
 
       try {
         const blob = await uploadToBlob(pathname, file, {
@@ -480,40 +382,16 @@ export default function Home() {
           onUploadProgress: (event) => {
             const loaded = event.loaded || 0;
             const total = event.total || file.size || 1;
-            const percentage =
-              typeof event.percentage === "number"
-                ? event.percentage
-                : Math.round((loaded / Math.max(1, total)) * 100);
-            const safePercentage = Math.max(
-              1,
-              Math.min(99, Math.round(percentage)),
-            );
-            const elapsedSeconds = Math.max(
-              1,
-              (Date.now() - uploadStartedAtRef.current) / 1000,
-            );
-            const megabytesPerSecond =
-              loaded / 1024 / 1024 / elapsedSeconds;
-
-            setUploadProgress(safePercentage);
-            setUploadSpeed(
-              `${megabytesPerSecond.toFixed(1)} MB/s · ${bytesToSize(
-                loaded,
-              )} / ${bytesToSize(total)}`,
-            );
-            setUploadStatus("Uploading full match to Vercel Blob...");
-
-            setMatches((previous) =>
-              previous.map((match) =>
-                match.id === matchId
-                  ? {
-                      ...match,
-                      status: `uploading ${safePercentage}%`,
-                      upload_progress: safePercentage,
-                    }
-                  : match,
-              ),
-            );
+            const pct = typeof event.percentage === "number"
+              ? event.percentage
+              : Math.round((loaded / Math.max(1, total)) * 100);
+            const safePct = Math.max(1, Math.min(99, Math.round(pct)));
+            const elapsed = Math.max(1, (Date.now() - uploadStartedAtRef.current) / 1000);
+            setUploadProgress(safePct);
+            setUploadSpeed(`${(loaded / 1024 / 1024 / elapsed).toFixed(1)} MB/s · ${bytesToSize(loaded)} / ${bytesToSize(total)}`);
+            setMatches((previous) => previous.map((match) =>
+              match.id === matchId ? { ...match, status: `uploading ${safePct}%`, upload_progress: safePct } : match,
+            ));
           },
         });
 
@@ -524,73 +402,77 @@ export default function Home() {
           local_preview_url: localPreviewUrl,
           upload_progress: 100,
         };
-
         setUploadProgress(100);
-        setUploadStatus("Upload complete. Cloud video is ready.");
-        setSelected((current) =>
-          current?.id === matchId ? cloudMatch : current,
-        );
-        setMatches((previous) =>
-          previous.map((match) =>
-            match.id === matchId ? cloudMatch : match,
-          ),
-        );
+        setUploadStatus("Upload complete. Set the court, then run AI.");
+        setSelected(cloudMatch);
+        setMatches((previous) => previous.map((match) => (match.id === matchId ? cloudMatch : match)));
       } catch (cloudError) {
-        console.error("Cloud upload failed:", cloudError);
-
-        const localOnlyMatch: Match = {
-          ...localMatch,
-          status: "local preview only — cloud upload failed",
-          upload_progress: 0,
-        };
-
-        setSelected((current) =>
-          current?.id === matchId ? localOnlyMatch : current,
-        );
-        setMatches((previous) =>
-          previous.map((match) =>
-            match.id === matchId ? localOnlyMatch : match,
-          ),
-        );
+        console.error("Cloud upload failed", cloudError);
+        const localOnly = { ...localMatch, status: "local preview only — cloud upload failed" };
+        setSelected(localOnly);
+        setMatches((previous) => previous.map((match) => (match.id === matchId ? localOnly : match)));
         setUploadProgress(0);
-        setUploadSpeed("");
-        setUploadStatus(
-          "Cloud upload failed, but the local preview is ready.",
-        );
+        setUploadStatus("Cloud upload failed. Local preview still works.");
       }
     } catch (error) {
-      console.error("Could not prepare video:", error);
-
-      if (localPreviewUrl) {
-        URL.revokeObjectURL(localPreviewUrl);
-        localPreviewUrlsRef.current = localPreviewUrlsRef.current.filter(
-          (url) => url !== localPreviewUrl,
-        );
-      }
-
-      setUploadStatus("Could not open the selected video.");
-      setUploadProgress(0);
-      setUploadSpeed("");
-      alert(
-        error instanceof Error
-          ? `Could not open the video: ${error.message}`
-          : "Could not open the selected video.",
-      );
+      console.error(error);
+      setUploadStatus("Could not open video.");
+      alert(error instanceof Error ? error.message : "Could not open video.");
     } finally {
       setLoading(false);
     }
   }
 
-  async function runAiWorker(match: Match, firstServeSeconds = currentTime) {
-    if (!match.court_calibration?.confirmed || match.court_calibration.points.length !== 4) {
-      return alert("Set and confirm the four court corners before running the AI worker.");
-    }
-    if (!match.video_url || match.video_url.startsWith("blob:")) {
-      return alert("Wait until the Vercel Blob upload finishes before running AI worker analysis.");
+  async function pollJob(jobId: string, match: Match) {
+    pollCancelledRef.current = false;
+    const started = Date.now();
+    const maxWaitMs = 2 * 60 * 60 * 1000;
+
+    while (!pollCancelledRef.current && Date.now() - started < maxWaitMs) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2000));
+      const response = await fetch(`/api/analyze?job_id=${encodeURIComponent(jobId)}`, { cache: "no-store" });
+      const job: JobResponse & { error?: string } = await response.json();
+      if (!response.ok) throw new Error(job.error || "Could not check AI job.");
+
+      setAnalyzeProgress(job.progress || 0);
+      setAnalyzeStatus(job.message || job.status);
+
+      if (job.status === "failed") throw new Error(job.error || "AI analysis failed.");
+      if (job.status !== "complete") continue;
+
+      const result = job.result;
+      if (!result?.tracking) throw new Error("AI job completed without tracking data.");
+
+      setTracking(result.tracking);
+      const updated: Match = {
+        ...match,
+        status: `AI analyzed: ${result.model_version}`,
+        rallies: result.rallies || [],
+        tracking_summary: trackingSummary(result.tracking),
+      };
+      updateMatch(updated);
+      setAnalyzeProgress(100);
+      setAnalyzeStatus(result.message || "AI tracking complete.");
+      return;
     }
 
+    throw new Error("AI job did not finish before the browser polling limit.");
+  }
+
+  async function runAiWorker(match: Match) {
+    if (!match.court_calibration?.confirmed || match.court_calibration.points.length !== 4) {
+      return alert("Set and confirm the four court corners before running AI.");
+    }
+    if (!match.video_url || match.video_url.startsWith("blob:")) {
+      return alert("Wait for the Vercel Blob upload to finish before running AI.");
+    }
+
+    pollCancelledRef.current = true;
     setAnalyzing(true);
-    setAnalyzeStatus("Sending match to AI worker...");
+    setAnalyzeProgress(0);
+    setAnalyzeStatus("Starting background AI job...");
+    setTracking(null);
+
     try {
       const response = await fetch("/api/analyze", {
         method: "POST",
@@ -601,24 +483,17 @@ export default function Home() {
           opponent: match.opponent,
           video_url: match.video_url,
           duration_seconds: match.duration_seconds,
-          first_serve_seconds: firstServeSeconds,
+          first_serve_seconds: currentTime,
           court_points: match.court_calibration.points,
           court_frame_time: match.court_calibration.frame_time,
         }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "AI worker failed");
-
-      const updated = {
-        ...match,
-        status: `AI analyzed: ${data.model_version || "worker"}`,
-        rallies: data.rallies || [],
-      };
-      setSelected(updated);
-      setMatches((prev) => prev.map((m) => (m.id === match.id ? updated : m)));
-      setAnalyzeStatus(data.message || "AI worker analysis complete. Review and correct the tags.");
+      const data: JobResponse & { error?: string } = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not start AI job.");
+      setAnalyzeStatus(data.message || "AI job queued.");
+      await pollJob(data.job_id, match);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "AI worker failed";
+      const message = error instanceof Error ? error.message : "AI worker failed.";
       setAnalyzeStatus(message);
       alert(message);
     } finally {
@@ -628,117 +503,52 @@ export default function Home() {
 
   async function deleteMatch(match: Match) {
     if (!confirm(`Remove "${match.title}" from this app and Vercel Blob?`)) return;
+    pollCancelledRef.current = true;
     try {
-      await fetch("/api/blob-delete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: match.video_url }),
-      });
-    } catch (err) {
-      console.warn("Blob delete failed; removing local metadata anyway", err);
+      if (!match.video_url.startsWith("blob:")) {
+        await fetch("/api/blob-delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: match.video_url }),
+        });
+      }
+    } catch (error) {
+      console.warn("Blob delete failed", error);
     }
-    const remaining = matches.filter((m) => m.id !== match.id);
+    const remaining = matches.filter((item) => item.id !== match.id);
     setMatches(remaining);
     if (selected?.id === match.id) setSelected(remaining[0] || null);
-    setPlaybackMode("normal");
-  }
-
-  function clearVideoLibrary() {
-    if (!confirm("Remove all saved match references from this browser? This does not delete cloud files.")) return;
-    setMatches([]);
-    setSelected(null);
-    setPlaybackMode("normal");
   }
 
   function addManualTouch() {
     if (!selected) return;
     const start = videoRef.current?.currentTime || 0;
-    const rosterHit = roster.find((p) => `#${p.number}` === tagPlayer || p.number === tagPlayer.replace("#", ""));
-    const player = rosterHit ? playerText(rosterHit) : tagPlayer;
-    const rally = sortedRallies.find((r) => start >= r.start_time && start <= r.end_time);
+    const rallyId = Date.now();
     const touch: Touch = {
-      id: Date.now(),
-      rally_id: rally?.id || Date.now() + 1,
+      id: rallyId * 100,
+      rally_id: rallyId,
       start_time: start,
-      end_time: Math.min(selected.duration_seconds, start + 2),
+      end_time: Math.min(selected.duration_seconds, start + 1.5),
       action: tagAction,
-      player,
+      player: tagPlayer,
       outcome: tagOutcome,
-      notes: rosterHit ? `Manual tag. Body-build note: ${rosterHit.build}` : "Manual tag",
+      notes: "Manual user tag — not generated by the current AI model.",
       confidence: 1,
     };
-
-    let updatedRallies: Rally[];
-    if (rally) {
-      updatedRallies = selected.rallies.map((r) =>
-        r.id === rally.id ? { ...r, touches: [...r.touches, touch].sort((a, b) => a.start_time - b.start_time) } : r,
-      );
-    } else {
-      updatedRallies = [
-        ...selected.rallies,
-        {
-          id: touch.rally_id,
-          match_id: selected.id,
-          start_time: start,
-          end_time: Math.min(selected.duration_seconds, start + 10),
-          phase: "Manual rally",
-          result: tagOutcome,
-          confidence: 1,
-          touches: [touch],
-        },
-      ].sort((a, b) => a.start_time - b.start_time);
-    }
-    const updated = { ...selected, rallies: updatedRallies };
-    setSelected(updated);
-    setMatches((prev) => prev.map((m) => (m.id === selected.id ? updated : m)));
-  }
-
-  function playPlaylist(rallies: Rally[], mode: PlaybackMode) {
-    if (!selected || !rallies.length || !videoRef.current) return alert("No rallies yet. Upload a video or add a manual tag.");
-    setActivePlaylist(rallies);
-    setPlaylistIndex(0);
-    setPlaybackMode(mode);
-    setCurrentRallyId(rallies[0].id);
-    videoRef.current.currentTime = rallies[0].start_time;
-    videoRef.current.play();
-  }
-
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    const onTimeUpdate = () => {
-      setCurrentTime(video.currentTime);
-      if (playbackMode === "normal" || !activePlaylist.length) return;
-      const current = activePlaylist[playlistIndex];
-      if (!current) return;
-      if (video.currentTime >= current.end_time) {
-        const nextIndex = playlistIndex + 1;
-        if (nextIndex >= activePlaylist.length) {
-          video.pause();
-          setPlaybackMode("normal");
-          return;
-        }
-        const next = activePlaylist[nextIndex];
-        setPlaylistIndex(nextIndex);
-        setCurrentRallyId(next.id);
-        video.currentTime = next.start_time;
-        video.play();
-      }
+    const rally: Rally = {
+      id: rallyId,
+      match_id: selected.id,
+      start_time: start,
+      end_time: Math.min(selected.duration_seconds, start + 8),
+      phase: "Manual event",
+      result: tagOutcome,
+      confidence: 1,
+      touches: [touch],
     };
-    video.addEventListener("timeupdate", onTimeUpdate);
-    return () => video.removeEventListener("timeupdate", onTimeUpdate);
-  }, [playbackMode, activePlaylist, playlistIndex]);
+    updateMatch({ ...selected, rallies: [...selected.rallies, rally].sort((a, b) => a.start_time - b.start_time) });
+  }
 
-  const actionStats = allTouches.reduce<Record<string, number>>((acc, e) => {
-    acc[e.action] = (acc[e.action] || 0) + 1;
-    return acc;
-  }, {});
-  const playerStats = allTouches.reduce<Record<string, number>>((acc, e) => {
-    acc[e.player] = (acc[e.player] || 0) + 1;
-    return acc;
-  }, {});
-  const rallySeconds = sortedRallies.reduce((sum, e) => sum + Math.max(0, e.end_time - e.start_time), 0);
-  const deadTimeRemoved = Math.max(0, (selected?.duration_seconds || 0) - rallySeconds);
+  const summary = tracking ? trackingSummary(tracking) : selected?.tracking_summary;
 
   return (
     <main className="min-h-screen p-6">
@@ -746,7 +556,7 @@ export default function Home() {
         <div className="mb-8 rounded-3xl bg-gradient-to-r from-blue-600 to-cyan-500 p-8 shadow-2xl">
           <p className="text-sm uppercase tracking-widest text-blue-100">Volleyball AI Video Analysis</p>
           <h1 className="mt-2 text-5xl font-black">VolleyVision AI</h1>
-          <p className="mt-3 max-w-3xl text-blue-50">Cloud-storage mode: full match files upload to Vercel Blob, while rally sequences, player-role estimates, live event tracking, and correction tools stay in the app.</p>
+          <p className="mt-3 max-w-3xl text-blue-50">Real court-filtered YOLO + ByteTrack analysis with background processing. Automatic volleyball touch recognition comes after a trained ball/action model is added.</p>
         </div>
 
         <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
@@ -756,30 +566,28 @@ export default function Home() {
               <input className="mt-4 w-full rounded bg-white/10 p-2" value={title} onChange={(e) => setTitle(e.target.value)} />
               <input className="mt-3 w-full rounded bg-white/10 p-2" value={opponent} onChange={(e) => setOpponent(e.target.value)} />
               <input className="mt-3 w-full" type="file" accept="video/*" onChange={(e) => setFile(e.target.files?.[0] || null)} />
-              {file && <p className="mt-2 text-xs text-white/60">Selected: {file.name} · {bytesToSize(file.size)}</p>}
+              {file && <p className="mt-2 text-xs text-white/60">{file.name} · {bytesToSize(file.size)}</p>}
               {(loading || uploadProgress > 0) && (
                 <div className="mt-4">
                   <div className="mb-1 flex justify-between text-xs text-white/70"><span>{uploadStatus}</span><span>{uploadProgress}%</span></div>
-                  <div className="h-3 overflow-hidden rounded-full bg-white/10"><div className="h-full bg-cyan-400 transition-all" style={{ width: `${uploadProgress}%` }} /></div>{uploadSpeed && <p className="mt-1 text-xs text-white/50">{uploadSpeed}</p>}
+                  <div className="h-3 overflow-hidden rounded-full bg-white/10"><div className="h-full bg-cyan-400 transition-all" style={{ width: `${uploadProgress}%` }} /></div>
+                  {uploadSpeed && <p className="mt-1 text-xs text-white/50">{uploadSpeed}</p>}
                 </div>
               )}
-              <button onClick={upload} disabled={loading} className="mt-4 w-full rounded-xl bg-cyan-400 px-4 py-3 font-bold text-slate-950 hover:bg-cyan-300 disabled:opacity-60">
-                {loading ? "Uploading to Blob..." : "Upload + Process"}
-              </button>
+              <button onClick={upload} disabled={loading} className="mt-4 w-full rounded-xl bg-cyan-400 px-4 py-3 font-bold text-slate-950 hover:bg-cyan-300 disabled:opacity-60">{loading ? "Uploading..." : "Upload + Process"}</button>
               <p className="mt-3 text-xs text-white/50">{storageMessage}</p>
-              <p className="mt-1 text-xs text-white/40">Videos are stored in Vercel Blob and only URLs/metadata are saved in this browser. During upload, the app uses the local file for instant preview so playback starts faster.</p>
             </div>
 
             <div className="rounded-2xl bg-white/10 p-5 shadow-xl ring-1 ring-white/10">
-              <h2 className="text-xl font-bold">Roster / role hints</h2>
-              <p className="mt-1 text-sm text-white/60">Add each player plus role. The estimator uses this to assign pass/set/attack/block touches inside each rally.</p>
+              <h2 className="text-xl font-bold">Roster</h2>
+              <p className="mt-1 text-sm text-white/60">Saved for future jersey/action identity models. Current tracking uses anonymous track IDs.</p>
               <div className="mt-3 space-y-2">
-                {roster.map((p, i) => (
-                  <div key={i} className="grid grid-cols-[56px_1fr] gap-2 rounded-xl bg-white/5 p-2">
-                    <input className="rounded bg-white/10 p-2" value={p.number} onChange={(e) => setRoster((r) => r.map((x, idx) => (idx === i ? { ...x, number: e.target.value } : x)))} placeholder="#" />
-                    <input className="rounded bg-white/10 p-2" value={p.name} onChange={(e) => setRoster((r) => r.map((x, idx) => (idx === i ? { ...x, name: e.target.value } : x)))} placeholder="Name" />
-                    <input className="rounded bg-white/10 p-2 text-sm" value={p.role} onChange={(e) => setRoster((r) => r.map((x, idx) => (idx === i ? { ...x, role: e.target.value } : x)))} placeholder="setter/libero/outside" />
-                    <input className="rounded bg-white/10 p-2 text-sm" value={p.build} onChange={(e) => setRoster((r) => r.map((x, idx) => (idx === i ? { ...x, build: e.target.value } : x)))} placeholder="body build" />
+                {roster.map((player, index) => (
+                  <div key={index} className="grid grid-cols-[56px_1fr] gap-2 rounded-xl bg-white/5 p-2">
+                    <input className="rounded bg-white/10 p-2" value={player.number} onChange={(e) => setRoster((items) => items.map((item, i) => i === index ? { ...item, number: e.target.value } : item))} placeholder="#" />
+                    <input className="rounded bg-white/10 p-2" value={player.name} onChange={(e) => setRoster((items) => items.map((item, i) => i === index ? { ...item, name: e.target.value } : item))} placeholder="Name" />
+                    <input className="rounded bg-white/10 p-2 text-sm" value={player.role} onChange={(e) => setRoster((items) => items.map((item, i) => i === index ? { ...item, role: e.target.value } : item))} placeholder="Role" />
+                    <input className="rounded bg-white/10 p-2 text-sm" value={player.build} onChange={(e) => setRoster((items) => items.map((item, i) => i === index ? { ...item, build: e.target.value } : item))} placeholder="Build" />
                   </div>
                 ))}
               </div>
@@ -787,13 +595,13 @@ export default function Home() {
             </div>
 
             <div className="rounded-2xl bg-white/10 p-5 shadow-xl ring-1 ring-white/10">
-              <div className="flex items-center justify-between"><h2 className="text-xl font-bold">Matches</h2><button onClick={clearVideoLibrary} className="text-xs text-red-200 hover:text-red-100">Clear list</button></div>
+              <h2 className="text-xl font-bold">Matches</h2>
               <div className="mt-3 space-y-2">
-                {matches.map((m) => (
-                  <div key={m.id} className={`rounded-xl p-3 ${selected?.id === m.id ? "bg-cyan-400 text-slate-950" : "bg-white/10"}`}>
-                    <button onClick={() => setSelected(m)} className="w-full text-left font-bold">{m.title}</button>
-                    <p className="text-sm opacity-80">{m.status} · {m.rallies.length} rallies · {bytesToSize(m.file_size)}</p>{typeof m.upload_progress === "number" && m.upload_progress > 0 && m.upload_progress < 100 && <div className="mt-2 h-2 overflow-hidden rounded-full bg-white/20"><div className="h-full bg-cyan-300" style={{ width: `${m.upload_progress}%` }} /></div>}
-                    <button onClick={() => deleteMatch(m)} className="mt-2 rounded bg-red-500/80 px-3 py-1 text-xs font-bold text-white hover:bg-red-500">Delete cloud video</button>
+                {matches.map((match) => (
+                  <div key={match.id} className={`rounded-xl p-3 ${selected?.id === match.id ? "bg-cyan-400 text-slate-950" : "bg-white/10"}`}>
+                    <button onClick={() => setSelected(match)} className="w-full text-left font-bold">{match.title}</button>
+                    <p className="text-sm opacity-80">{match.status} · {bytesToSize(match.file_size)}</p>
+                    <button onClick={() => deleteMatch(match)} className="mt-2 rounded bg-red-500/80 px-3 py-1 text-xs font-bold text-white">Delete</button>
                   </div>
                 ))}
               </div>
@@ -807,49 +615,43 @@ export default function Home() {
               <>
                 <div className="rounded-2xl bg-white/10 p-5 shadow-xl ring-1 ring-white/10">
                   <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div><h2 className="text-2xl font-black">{selected.title}</h2><p className="text-white/70">vs {selected.opponent} · {formatTime(selected.duration_seconds)} · {selected.status}</p></div>
+                    <div>
+                      <h2 className="text-2xl font-black">{selected.title}</h2>
+                      <p className="text-white/70">vs {selected.opponent} · {formatTime(selected.duration_seconds)} · {selected.status}</p>
+                    </div>
                     <div className="flex flex-wrap gap-2">
-                      <button onClick={beginCourtCalibration} className="rounded-xl bg-amber-300 px-4 py-2 font-bold text-slate-950 hover:bg-amber-200">{courtConfirmed ? "Edit court" : "Set court"}</button>
-                      <button disabled={analyzing || selected.video_url.startsWith("blob:") || !courtConfirmed} onClick={() => runAiWorker(selected, currentTime)} className="rounded-xl bg-purple-400 px-4 py-2 font-bold text-slate-950 hover:bg-purple-300 disabled:opacity-50">{analyzing ? "AI analyzing..." : "Run AI worker from current time"}</button>
-                      <button disabled={!top5Rallies.length} onClick={() => playPlaylist(top5Rallies, "top5")} className="rounded-xl bg-cyan-400 px-4 py-2 font-bold text-slate-950 hover:bg-cyan-300 disabled:opacity-50">Preview top 5 rallies</button>
-                      <button disabled={!sortedRallies.length} onClick={() => playPlaylist(sortedRallies, "rally-only")} className="rounded-xl bg-green-400 px-4 py-2 font-bold text-slate-950 hover:bg-green-300 disabled:opacity-50">Play rally-only</button>
-                      {playbackMode !== "normal" && <button onClick={() => setPlaybackMode("normal")} className="rounded-xl bg-white/15 px-4 py-2 font-bold hover:bg-white/25">Stop smart playback</button>}
+                      <button onClick={beginCourtCalibration} disabled={analyzing} className="rounded-xl bg-amber-300 px-4 py-2 font-bold text-slate-950 disabled:opacity-50">{courtConfirmed ? "Edit court" : "Set court"}</button>
+                      <button disabled={analyzing || selected.video_url.startsWith("blob:") || !courtConfirmed} onClick={() => runAiWorker(selected)} className="rounded-xl bg-purple-400 px-4 py-2 font-bold text-slate-950 disabled:opacity-50">{analyzing ? `AI ${analyzeProgress}%` : "Run AI worker"}</button>
                     </div>
                   </div>
+
                   <div className="relative mt-5 overflow-hidden rounded-xl bg-black">
-                    <video ref={videoRef} className="block w-full bg-black" controls={!courtCalibrationMode} playsInline preload="metadata" src={selected.local_preview_url || selected.video_url} />
-                    {(courtCalibrationMode || courtPoints.length > 0) && (
-                      <div
-                        className={`absolute inset-0 ${courtCalibrationMode ? "cursor-crosshair" : "pointer-events-none"}`}
-                        onClick={addCourtCorner}
-                      >
+                    <video ref={videoRef} className="block w-full bg-black" controls={!courtCalibrationMode} playsInline preload="metadata" src={selected.local_preview_url || selected.video_url} onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)} />
+
+                    {(courtCalibrationMode || courtPoints.length > 0 || currentTrackingFrame) && (
+                      <div className={`absolute inset-0 ${courtCalibrationMode ? "cursor-crosshair" : "pointer-events-none"}`} onClick={addCourtCorner}>
                         <svg className="h-full w-full" viewBox="0 0 1 1" preserveAspectRatio="none">
                           {courtPoints.length >= 2 && (
-                            <polyline
-                              points={[...courtPoints, ...(courtPoints.length === 4 ? [courtPoints[0]] : [])].map((point) => `${point.x},${point.y}`).join(" ")}
-                              fill={courtPoints.length === 4 ? "rgba(34,211,238,0.14)" : "none"}
-                              stroke="rgb(34,211,238)"
-                              strokeWidth="0.006"
-                              vectorEffect="non-scaling-stroke"
-                            />
+                            <polyline points={[...courtPoints, ...(courtPoints.length === 4 ? [courtPoints[0]] : [])].map((point) => `${point.x},${point.y}`).join(" ")} fill={courtPoints.length === 4 ? "rgba(34,211,238,0.10)" : "none"} stroke="rgb(34,211,238)" strokeWidth="0.004" vectorEffect="non-scaling-stroke" />
                           )}
+
+                          {tracking && currentTrackingFrame?.players.map((player) => {
+                            const x = player.box.x1 / tracking.width;
+                            const y = player.box.y1 / tracking.height;
+                            const w = (player.box.x2 - player.box.x1) / tracking.width;
+                            const h = (player.box.y2 - player.box.y1) / tracking.height;
+                            return (
+                              <g key={player.track_id}>
+                                <rect x={x} y={y} width={w} height={h} fill="none" stroke="rgb(34,197,94)" strokeWidth="0.004" vectorEffect="non-scaling-stroke" />
+                                <rect x={x} y={Math.max(0, y - 0.035)} width="0.085" height="0.035" fill="rgba(15,23,42,0.88)" />
+                                <text x={x + 0.004} y={Math.max(0.026, y - 0.009)} fill="white" fontSize="0.026" fontWeight="800">ID {player.track_id}</text>
+                              </g>
+                            );
+                          })}
+
                           {courtPoints.map((point, index) => (
                             <g key={`${index}-${point.x}-${point.y}`}>
-                              <circle
-                                cx={point.x}
-                                cy={point.y}
-                                r="0.018"
-                                fill="rgb(250,204,21)"
-                                stroke="white"
-                                strokeWidth="0.004"
-                                vectorEffect="non-scaling-stroke"
-                                className={courtCalibrationMode ? "cursor-grab active:cursor-grabbing" : ""}
-                                onClick={(event) => event.stopPropagation()}
-                                onPointerDown={(event) => startCornerDrag(index, event)}
-                                onPointerMove={(event) => dragCorner(index, event)}
-                                onPointerUp={stopCornerDrag}
-                                onPointerCancel={stopCornerDrag}
-                              />
+                              <circle cx={point.x} cy={point.y} r="0.018" fill="rgb(250,204,21)" stroke="white" strokeWidth="0.004" vectorEffect="non-scaling-stroke" className={courtCalibrationMode ? "cursor-grab" : ""} onClick={(event) => event.stopPropagation()} onPointerDown={(event) => startCornerDrag(index, event)} onPointerMove={(event) => dragCorner(index, event)} onPointerUp={stopCornerDrag} onPointerCancel={stopCornerDrag} />
                               <text x={point.x} y={point.y - 0.028} textAnchor="middle" fill="white" fontSize="0.035" fontWeight="800">{index + 1}</text>
                             </g>
                           ))}
@@ -857,74 +659,63 @@ export default function Home() {
                       </div>
                     )}
                   </div>
+
                   {courtCalibrationMode && (
                     <div className="mt-3 rounded-xl bg-amber-950/50 p-4 ring-1 ring-amber-300/30">
-                      <div className="font-bold text-amber-100">Court calibration · {courtPoints.length}/4 corners selected</div>
-                      <p className="mt-1 text-sm text-amber-100/75">Click the four outer court corners in order around the court. After four clicks, drag any numbered point to adjust it.</p>
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        <button onClick={resetCourtCalibration} className="rounded-lg bg-white/15 px-3 py-2 text-sm font-bold hover:bg-white/25">Reset corners</button>
-                        <button onClick={() => { setCourtCalibrationMode(false); setCourtPoints(selected.court_calibration?.points || []); setCourtConfirmed(Boolean(selected.court_calibration?.confirmed)); }} className="rounded-lg bg-white/15 px-3 py-2 text-sm font-bold hover:bg-white/25">Cancel</button>
-                        <button disabled={courtPoints.length !== 4} onClick={confirmCourtCalibration} className="rounded-lg bg-cyan-300 px-3 py-2 text-sm font-bold text-slate-950 hover:bg-cyan-200 disabled:opacity-40">Confirm court</button>
+                      <div className="font-bold text-amber-100">Court calibration · {courtPoints.length}/4</div>
+                      <p className="mt-1 text-sm text-amber-100/75">Click the four outside court corners in order around the court, then drag points to fine-tune them.</p>
+                      <div className="mt-3 flex gap-2">
+                        <button onClick={resetCourtCalibration} className="rounded-lg bg-white/15 px-3 py-2 text-sm font-bold">Reset</button>
+                        <button onClick={() => { setCourtCalibrationMode(false); setCourtPoints(selected.court_calibration?.points || []); setCourtConfirmed(Boolean(selected.court_calibration?.confirmed)); }} className="rounded-lg bg-white/15 px-3 py-2 text-sm font-bold">Cancel</button>
+                        <button disabled={courtPoints.length !== 4} onClick={confirmCourtCalibration} className="rounded-lg bg-cyan-300 px-3 py-2 text-sm font-bold text-slate-950 disabled:opacity-40">Confirm court</button>
                       </div>
                     </div>
                   )}
-                  {!courtCalibrationMode && courtConfirmed && (
-                    <p className="mt-2 text-sm font-semibold text-cyan-200">Court calibrated. The four normalized corner points will be sent with AI analysis.</p>
-                  )}
+
                   <div className="mt-3 rounded-xl bg-purple-950/40 p-3 text-sm text-purple-100 ring-1 ring-purple-300/20">
-                    <strong>AI worker:</strong> {analyzeStatus}. First set and confirm the four court corners. Then scrub to the first real serve and click <strong>Run AI worker from current time</strong>. The court points are saved with the match and sent as normalized coordinates.
+                    <div className="flex justify-between gap-3"><strong>AI worker</strong><span>{analyzing ? `${analyzeProgress}%` : ""}</span></div>
+                    <p className="mt-1">{analyzeStatus}</p>
+                    {analyzing && <div className="mt-2 h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full bg-purple-300 transition-all" style={{ width: `${analyzeProgress}%` }} /></div>}
                   </div>
+
                   <div className="mt-4 rounded-xl bg-slate-950/50 p-4 ring-1 ring-white/10">
-                    <div className="text-sm uppercase tracking-widest text-cyan-200">Live tracker · {formatTime(currentTime)}</div>
-                    <div className="mt-2 text-2xl font-black">{activeTouch ? `${activeTouch.action}: ${activeTouch.player}` : "No active touch yet"}</div>
-                    <div className="text-white/70">{activeRally ? `${activeRally.phase} → ${activeRally.result}` : "Press play to follow the breakdown."}</div>
+                    <div className="text-sm uppercase tracking-widest text-cyan-200">Tracking overlay · {formatTime(currentTime)}</div>
+                    <div className="mt-2 text-2xl font-black">{currentTrackingFrame ? `${currentTrackingFrame.players.length} tracked players visible` : "No tracking overlay loaded"}</div>
+                    <div className="text-white/70">{currentTrackingFrame ? currentTrackingFrame.players.map((player) => `ID ${player.track_id}`).join(" · ") || "No accepted player detections in this frame" : "Run AI to load real player boxes and IDs."}</div>
                   </div>
                 </div>
 
-                <div className="grid gap-6 md:grid-cols-4">
-                  <Stat label="Rallies" value={String(sortedRallies.length)} />
-                  <Stat label="Touches/actions" value={String(allTouches.length)} />
-                  <Stat label="Active play" value={formatTime(rallySeconds)} />
-                  <Stat label="Dead time skipped" value={formatTime(deadTimeRemoved)} />
+                <div className="grid gap-4 md:grid-cols-4">
+                  <Stat label="Persistent track IDs" value={String(summary?.unique_track_count ?? 0)} />
+                  <Stat label="Detections kept" value={String(summary?.detections_kept ?? 0)} />
+                  <Stat label="Off-court removed" value={String(summary?.detections_removed_outside_court ?? 0)} />
+                  <Stat label="Frames tracked" value={String(summary?.frame_count ?? 0)} />
                 </div>
 
                 <div className="rounded-2xl bg-white/10 p-5 shadow-xl ring-1 ring-white/10">
-                  <h2 className="text-xl font-bold">Add touch at current video time</h2>
+                  <h2 className="text-xl font-bold">Manual touch annotation</h2>
+                  <p className="mt-1 text-sm text-white/60">Use this to create training/reference labels. These are intentionally separate from the current player-tracking AI.</p>
                   <div className="mt-3 grid gap-2 md:grid-cols-4">
                     <input className="rounded bg-white/10 p-2" value={tagPlayer} onChange={(e) => setTagPlayer(e.target.value)} placeholder="#12" />
-                    <input className="rounded bg-white/10 p-2" value={tagAction} onChange={(e) => setTagAction(e.target.value)} placeholder="attack" />
-                    <input className="rounded bg-white/10 p-2" value={tagOutcome} onChange={(e) => setTagOutcome(e.target.value)} placeholder="kill" />
-                    <button onClick={addManualTouch} className="rounded-xl bg-white/15 px-4 py-2 font-bold hover:bg-white/25">Add live-tracked touch</button>
+                    <input className="rounded bg-white/10 p-2" value={tagAction} onChange={(e) => setTagAction(e.target.value)} placeholder="serve / receive / set / attack / dig / block" />
+                    <input className="rounded bg-white/10 p-2" value={tagOutcome} onChange={(e) => setTagOutcome(e.target.value)} placeholder="kill / in-system / error" />
+                    <button onClick={addManualTouch} className="rounded-xl bg-white/15 px-4 py-2 font-bold hover:bg-white/25">Add at current time</button>
                   </div>
                 </div>
 
                 <div className="rounded-2xl bg-white/10 p-5 shadow-xl ring-1 ring-white/10">
-                  <h2 className="text-xl font-bold">Player/event summary</h2>
-                  <div className="mt-3 grid gap-3 md:grid-cols-2">
-                    <Summary title="Actions by type" data={actionStats} />
-                    <Summary title="Estimated/manual players" data={playerStats} />
-                  </div>
-                </div>
-
-                <div className="rounded-2xl bg-white/10 p-5 shadow-xl ring-1 ring-white/10">
-                  <h2 className="text-xl font-bold">Live rally breakdown</h2>
-                  <p className="mt-1 text-sm text-white/60">This list follows the video. The current touch stays highlighted and scrolls into view. Click any row to jump there.</p>
-                  <div className="mt-4 max-h-[560px] overflow-auto rounded-xl border border-white/10">
+                  <h2 className="text-xl font-bold">Touch labels</h2>
+                  <p className="mt-1 text-sm text-white/60">Automatic serve/receive/set/attack/dig/block recognition is not enabled until you train and connect a ball/action model. Current entries below are manual labels only.</p>
+                  <div className="mt-4 max-h-[420px] overflow-auto rounded-xl border border-white/10">
                     <table className="w-full text-sm">
-                      <thead className="sticky top-0 bg-slate-900 text-left"><tr><th className="p-3">Time</th><th>Rally</th><th>Action sequence</th><th>Player</th><th>Outcome</th><th>Confidence</th></tr></thead>
+                      <thead className="sticky top-0 bg-slate-900 text-left"><tr><th className="p-3">Time</th><th>Action</th><th>Player</th><th>Outcome</th></tr></thead>
                       <tbody>
-                        {sortedRallies.map((r) =>
-                          r.touches.map((t, idx) => (
-                            <tr ref={currentTouchId === t.id ? activeRowRef : null} key={t.id} onClick={() => jumpToTime(t.start_time)} title={t.notes} className={`cursor-pointer border-t border-white/10 hover:bg-cyan-400/20 ${currentTouchId === t.id ? "bg-cyan-400/40" : currentRallyId === r.id ? "bg-cyan-400/10" : ""}`}>
-                              <td className="p-3 font-bold text-cyan-200">{formatTime(t.start_time)}</td>
-                              <td>{idx === 0 ? <button onClick={(e) => { e.stopPropagation(); jumpToTime(r.start_time); }} className="rounded bg-white/10 px-2 py-1 text-xs font-bold hover:bg-white/20">{formatTime(r.start_time)}-{formatTime(r.end_time)}</button> : ""}</td>
-                              <td><span className="capitalize font-bold">{t.action}</span>{idx === 0 && <span className="ml-2 text-white/50">({r.phase})</span>}</td>
-                              <td>{t.player}</td>
-                              <td>{t.outcome}</td>
-                              <td>{Math.round(t.confidence * 100)}%</td>
-                            </tr>
-                          )),
-                        )}
+                        {allTouches.map((touch) => (
+                          <tr key={touch.id} className="border-t border-white/10 cursor-pointer hover:bg-white/5" onClick={() => { if (videoRef.current) { videoRef.current.currentTime = touch.start_time; } }}>
+                            <td className="p-3 text-cyan-200">{formatTime(touch.start_time)}</td><td>{touch.action}</td><td>{touch.player}</td><td>{touch.outcome}</td>
+                          </tr>
+                        ))}
+                        {!allTouches.length && <tr><td className="p-4 text-white/50" colSpan={4}>No touch labels yet.</td></tr>}
                       </tbody>
                     </table>
                   </div>
@@ -940,15 +731,4 @@ export default function Home() {
 
 function Stat({ label, value }: { label: string; value: string }) {
   return <div className="rounded-2xl bg-white/10 p-5 ring-1 ring-white/10"><div className="text-3xl font-black">{value}</div><div className="text-white/70">{label}</div></div>;
-}
-
-function Summary({ title, data }: { title: string; data: Record<string, number> }) {
-  return (
-    <div className="rounded-xl bg-white/5 p-3">
-      <div className="font-bold">{title}</div>
-      {Object.entries(data).slice(0, 12).map(([k, v]) => (
-        <div key={k} className="mt-1 flex justify-between"><span>{k}</span><span>{v}</span></div>
-      ))}
-    </div>
-  );
 }
