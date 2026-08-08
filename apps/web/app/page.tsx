@@ -2,7 +2,7 @@
 
 import { upload as uploadToBlob } from "@vercel/blob/client";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { MouseEvent, PointerEvent } from "react";
+import type { MouseEvent } from "react";
 
 type CourtPoint = { x: number; y: number };
 type CourtCalibration = { points: CourtPoint[]; confirmed: boolean; frame_time: number };
@@ -158,7 +158,6 @@ export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const uploadStartedAtRef = useRef(0);
   const localPreviewUrlsRef = useRef<string[]>([]);
-  const draggingCornerRef = useRef<number | null>(null);
   const pollCancelledRef = useRef(false);
 
   const [matches, setMatches] = useState<Match[]>([]);
@@ -228,7 +227,8 @@ export default function Home() {
     setTracking(null);
     setAnalyzeProgress(0);
     setAnalyzeStatus(selected?.tracking_summary ? "Previous tracking summary loaded. Re-run AI to restore video overlay." : "AI worker not run yet");
-    setCourtPoints(selected?.court_calibration?.points || []);
+    const savedPoints = selected?.court_calibration?.points;
+    setCourtPoints(Array.isArray(savedPoints) ? savedPoints.filter((point) => Number.isFinite(point?.x) && Number.isFinite(point?.y)).slice(0, 4) : []);
     setCourtConfirmed(Boolean(selected?.court_calibration?.confirmed));
     setCourtCalibrationMode(false);
   }, [selected?.id]);
@@ -270,11 +270,10 @@ export default function Home() {
     setTracking(null);
   }
 
-  function normalizedPointFromPointer(
-    event: MouseEvent<HTMLDivElement> | PointerEvent<SVGCircleElement>,
-    element: HTMLElement | SVGElement,
+  function normalizedPointFromClick(
+    event: MouseEvent<HTMLDivElement>,
   ): CourtPoint {
-    const rect = element.getBoundingClientRect();
+    const rect = event.currentTarget.getBoundingClientRect();
     return {
       x: Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width))),
       y: Math.max(0, Math.min(1, (event.clientY - rect.top) / Math.max(1, rect.height))),
@@ -283,30 +282,8 @@ export default function Home() {
 
   function addCourtCorner(event: MouseEvent<HTMLDivElement>) {
     if (!courtCalibrationMode || courtPoints.length >= 4) return;
-    setCourtPoints((points) => [...points, normalizedPointFromPointer(event, event.currentTarget)]);
-  }
-
-  function startCornerDrag(index: number, event: PointerEvent<SVGCircleElement>) {
-    if (!courtCalibrationMode) return;
-    event.preventDefault();
-    event.stopPropagation();
-    draggingCornerRef.current = index;
-    event.currentTarget.setPointerCapture(event.pointerId);
-  }
-
-  function dragCorner(index: number, event: PointerEvent<SVGCircleElement>) {
-    if (!courtCalibrationMode || draggingCornerRef.current !== index) return;
-    const svg = event.currentTarget.ownerSVGElement;
-    if (!svg) return;
-    const point = normalizedPointFromPointer(event, svg);
-    setCourtPoints((points) => points.map((current, i) => (i === index ? point : current)));
-  }
-
-  function stopCornerDrag(event: PointerEvent<SVGCircleElement>) {
-    draggingCornerRef.current = null;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
+    const point = normalizedPointFromClick(event);
+    setCourtPoints((points) => [...points, point]);
   }
 
   function confirmCourtCalibration() {
@@ -651,7 +628,7 @@ export default function Home() {
 
                           {courtPoints.map((point, index) => (
                             <g key={`${index}-${point.x}-${point.y}`}>
-                              <circle cx={point.x} cy={point.y} r="0.018" fill="rgb(250,204,21)" stroke="white" strokeWidth="0.004" vectorEffect="non-scaling-stroke" className={courtCalibrationMode ? "cursor-grab" : ""} onClick={(event) => event.stopPropagation()} onPointerDown={(event) => startCornerDrag(index, event)} onPointerMove={(event) => dragCorner(index, event)} onPointerUp={stopCornerDrag} onPointerCancel={stopCornerDrag} />
+                              <circle cx={point.x} cy={point.y} r="0.018" fill="rgb(250,204,21)" stroke="white" strokeWidth="0.004" vectorEffect="non-scaling-stroke" />
                               <text x={point.x} y={point.y - 0.028} textAnchor="middle" fill="white" fontSize="0.035" fontWeight="800">{index + 1}</text>
                             </g>
                           ))}
@@ -663,7 +640,7 @@ export default function Home() {
                   {courtCalibrationMode && (
                     <div className="mt-3 rounded-xl bg-amber-950/50 p-4 ring-1 ring-amber-300/30">
                       <div className="font-bold text-amber-100">Court calibration · {courtPoints.length}/4</div>
-                      <p className="mt-1 text-sm text-amber-100/75">Click the four outside court corners in order around the court, then drag points to fine-tune them.</p>
+                      <p className="mt-1 text-sm text-amber-100/75">Click the four outside court corners in order around the court. If one is wrong, press Reset and click the four points again.</p>
                       <div className="mt-3 flex gap-2">
                         <button onClick={resetCourtCalibration} className="rounded-lg bg-white/15 px-3 py-2 text-sm font-bold">Reset</button>
                         <button onClick={() => { setCourtCalibrationMode(false); setCourtPoints(selected.court_calibration?.points || []); setCourtConfirmed(Boolean(selected.court_calibration?.confirmed)); }} className="rounded-lg bg-white/15 px-3 py-2 text-sm font-bold">Cancel</button>
