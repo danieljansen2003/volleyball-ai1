@@ -8,5 +8,5 @@ requests==2.32.3
 
 torch
 torchvision
-ultralytics
+ultralytics>=8.4.63,<9
 opencv-python-headless

@@ -14,9 +14,10 @@ from pydantic import BaseModel
 
 from app.pipeline.rally_detector import _download_video
 from app.player_tracker import PlayerTracker
+from app.action_detector import detect_actions
 from app.schemas import AnalyzeRequest, AnalyzeResponse, CourtPoint
 
-MODEL_VERSION = "court-player-tracker-jobs-v0.2"
+MODEL_VERSION = "volleyvision-active-learning-v0.3"
 JOB_TTL_SECONDS = 6 * 60 * 60
 
 app = FastAPI(title="VolleyVision AI Worker", version="0.3.0")
@@ -116,23 +117,44 @@ def _run_analysis(req: AnalyzeRequest, progress_hook=None) -> dict[str, Any]:
         )
 
         if progress_hook:
-            progress_hook(97, "Finalizing tracking result")
+            progress_hook(95, "Inferring volleyball contacts")
+
+        touches, action_diagnostics = detect_actions(tracking, req.match_id)
+        rallies = []
+        if touches:
+            rally_start = min(touch["start_time"] for touch in touches)
+            rally_end = max(touch["end_time"] for touch in touches)
+            rally_confidence = sum(float(touch["confidence"]) for touch in touches) / len(touches)
+            rallies = [
+                {
+                    "id": req.match_id,
+                    "match_id": req.match_id,
+                    "start_time": rally_start,
+                    "end_time": rally_end,
+                    "phase": "AI inferred rally",
+                    "result": touches[-1]["outcome"],
+                    "confidence": min(0.8, rally_confidence),
+                    "touches": touches,
+                }
+            ]
+
+        if progress_hook:
+            progress_hook(98, "Finalizing tracking and action candidates")
 
         message = (
-            "Court-filtered player tracking complete. "
-            f"{tracking['unique_track_count']} persistent track IDs, "
-            f"{tracking['detections_kept']} accepted detections, and "
-            f"{tracking['detections_removed_outside_court']} off-court detections removed. "
-            "Automatic serve/pass/set/attack labels are not generated yet because a trained "
-            "ball/action model is not present."
+            "Tracking complete with occlusion-aware ReID/stitching. "
+            f"{tracking['unique_track_count']} stable IDs from {tracking.get('raw_unique_track_count', tracking['unique_track_count'])} raw IDs; "
+            f"{tracking.get('ball_detections', 0)} sports-ball detections and {len(touches)} action candidates. "
+            "Action labels are experimental until you review them; corrections are intended to become training data."
         )
 
         return {
             "status": "complete",
             "message": message,
-            "rallies": [],
+            "rallies": rallies,
             "model_version": MODEL_VERSION,
             "tracking": tracking,
+            "action_diagnostics": action_diagnostics,
         }
     finally:
         try:

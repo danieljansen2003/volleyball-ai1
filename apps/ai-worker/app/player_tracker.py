@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,13 +17,21 @@ class PlayerTracker:
     def __init__(self) -> None:
         worker_root = Path(__file__).resolve().parent.parent
         model_path = worker_root / "yolo11n.pt"
-
+        model_source = str(model_path) if model_path.exists() else "yolo11n.pt"
         if not model_path.exists():
-            raise FileNotFoundError(f"YOLO model not found: {model_path}")
-
-        self.model = YOLO(str(model_path))
+            print("[player-tracker] Local yolo11n.pt not found; asking Ultralytics to download the official weight file.", flush=True)
+        self.model = YOLO(model_source)
         self.device = "mps" if torch.backends.mps.is_available() else "cpu"
-        print(f"[player-tracker] Loaded YOLO on device={self.device}", flush=True)
+        tracker_path = Path(__file__).resolve().parent / "trackers" / "volleyball_tracktrack.yaml"
+        self.tracker_path = str(tracker_path)
+        self.person_conf = float(os.getenv("VV_PERSON_CONF", "0.32"))
+        self.ball_conf = float(os.getenv("VV_BALL_CONF", "0.08"))
+        self.stitch_gap_seconds = float(os.getenv("VV_STITCH_GAP_SECONDS", "3.0"))
+        self.stitch_distance = float(os.getenv("VV_STITCH_DISTANCE", "0.22"))
+        print(
+            f"[player-tracker] Loaded YOLO on device={self.device} tracker={tracker_path.name}",
+            flush=True,
+        )
 
     @staticmethod
     def _build_court_polygon(
@@ -33,7 +43,6 @@ class PlayerTracker:
             return None
         if len(court_points) != 4:
             raise ValueError("Exactly four court points are required.")
-
         pixel_points: list[list[int]] = []
         for point in court_points:
             x = float(point["x"])
@@ -41,22 +50,127 @@ class PlayerTracker:
             if not 0 <= x <= 1 or not 0 <= y <= 1:
                 raise ValueError("Court coordinates must be normalized between 0 and 1.")
             pixel_points.append([int(round(x * width)), int(round(y * height))])
-
         return np.asarray(pixel_points, dtype=np.int32)
 
     @staticmethod
-    def _inside_court(
-        foot_x: float,
-        foot_y: float,
-        court_polygon: np.ndarray | None,
-    ) -> bool:
+    def _court_transform(court_polygon: np.ndarray | None) -> np.ndarray | None:
+        if court_polygon is None or len(court_polygon) != 4:
+            return None
+        src = court_polygon.astype(np.float32)
+        dst = np.asarray([[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]], dtype=np.float32)
+        return cv2.getPerspectiveTransform(src, dst)
+
+    @staticmethod
+    def _project_point(point: tuple[float, float], transform: np.ndarray | None) -> tuple[float, float] | None:
+        if transform is None:
+            return None
+        source = np.asarray([[[float(point[0]), float(point[1])]]], dtype=np.float32)
+        projected = cv2.perspectiveTransform(source, transform)[0][0]
+        return float(projected[0]), float(projected[1])
+
+    @staticmethod
+    def _inside_court(foot_x: float, foot_y: float, court_polygon: np.ndarray | None) -> bool:
         if court_polygon is None:
             return True
-        return cv2.pointPolygonTest(
-            court_polygon,
-            (float(foot_x), float(foot_y)),
-            False,
-        ) >= 0
+        return cv2.pointPolygonTest(court_polygon, (float(foot_x), float(foot_y)), False) >= 0
+
+    @staticmethod
+    def _build_segments(raw_frames: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+        segments: dict[int, dict[str, Any]] = {}
+        for frame in raw_frames:
+            frame_index = int(frame["frame"])
+            for player in frame["players"]:
+                raw_id = int(player["raw_track_id"])
+                segment = segments.setdefault(
+                    raw_id,
+                    {
+                        "raw_id": raw_id,
+                        "start": frame_index,
+                        "end": frame_index,
+                        "first_court": player.get("court_position"),
+                        "last_court": player.get("court_position"),
+                        "first_foot": player["foot"],
+                        "last_foot": player["foot"],
+                        "heights": [],
+                        "confidences": [],
+                    },
+                )
+                segment["end"] = frame_index
+                segment["last_court"] = player.get("court_position")
+                segment["last_foot"] = player["foot"]
+                segment["heights"].append(float(player["box"]["y2"] - player["box"]["y1"]))
+                segment["confidences"].append(float(player["confidence"]))
+        for segment in segments.values():
+            heights = segment["heights"]
+            segment["median_height"] = float(np.median(heights)) if heights else 1.0
+        return segments
+
+    def _stitch_track_ids(
+        self,
+        raw_frames: list[dict[str, Any]],
+        fps: float,
+        width: int,
+        height: int,
+    ) -> tuple[dict[int, int], dict[str, Any]]:
+        segments = self._build_segments(raw_frames)
+        ordered = sorted(segments.values(), key=lambda item: (item["start"], item["raw_id"]))
+        max_gap = max(1, int(round(fps * self.stitch_gap_seconds)))
+        mapping: dict[int, int] = {}
+        stable_last: dict[int, dict[str, Any]] = {}
+        next_stable = 1
+        stitched_pairs: list[dict[str, Any]] = []
+
+        def position(segment: dict[str, Any], first: bool) -> tuple[float, float]:
+            court = segment["first_court"] if first else segment["last_court"]
+            if court is not None:
+                return float(court["x"]), float(court["y"])
+            foot = segment["first_foot"] if first else segment["last_foot"]
+            return float(foot["x"]) / max(1.0, width), float(foot["y"]) / max(1.0, height)
+
+        for segment in ordered:
+            best_stable = None
+            best_score = 999.0
+            start_pos = position(segment, True)
+            current_height = max(1.0, float(segment["median_height"]))
+
+            for stable_id, previous in stable_last.items():
+                gap = int(segment["start"]) - int(previous["end"])
+                if gap <= 0 or gap > max_gap:
+                    continue
+                previous_pos = position(previous, False)
+                distance = math.dist(start_pos, previous_pos)
+                height_ratio = current_height / max(1.0, float(previous["median_height"]))
+                height_penalty = abs(math.log(max(0.01, height_ratio)))
+                if distance > self.stitch_distance or height_penalty > 0.65:
+                    continue
+                score = distance + 0.10 * height_penalty + 0.02 * (gap / max_gap)
+                if score < best_score:
+                    best_score = score
+                    best_stable = stable_id
+
+            if best_stable is None:
+                stable_id = next_stable
+                next_stable += 1
+            else:
+                stable_id = best_stable
+                stitched_pairs.append(
+                    {
+                        "from_raw_track_id": int(segment["raw_id"]),
+                        "stable_track_id": stable_id,
+                        "gap_frames": int(segment["start"] - stable_last[stable_id]["end"]),
+                        "score": round(best_score, 4),
+                    }
+                )
+
+            mapping[int(segment["raw_id"])] = stable_id
+            stable_last[stable_id] = segment
+
+        return mapping, {
+            "raw_track_count": len(segments),
+            "stable_track_count": len(set(mapping.values())),
+            "stitched_track_count": len(stitched_pairs),
+            "stitched_pairs": stitched_pairs,
+        }
 
     def track(
         self,
@@ -71,7 +185,6 @@ class PlayerTracker:
         capture = cv2.VideoCapture(str(path))
         if not capture.isOpened():
             raise RuntimeError(f"Could not open video: {path}")
-
         fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
         width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -79,30 +192,27 @@ class PlayerTracker:
         capture.release()
 
         court_polygon = self._build_court_polygon(court_points, width, height)
-
+        court_transform = self._court_transform(court_polygon)
         print(
-            f"[player-tracker] video={path.name} size={width}x{height} "
-            f"fps={fps:.3f} frames={reported_frame_count}",
+            f"[player-tracker] video={path.name} size={width}x{height} fps={fps:.3f} "
+            f"frames={reported_frame_count}",
             flush=True,
         )
-        if court_polygon is not None:
-            print(
-                f"[player-tracker] Court polygon pixels: {court_polygon.tolist()}",
-                flush=True,
-            )
 
         if progress_callback:
-            progress_callback(0, max(1, reported_frame_count), "Starting player detector")
+            progress_callback(0, max(1, reported_frame_count), "Starting person + ball detector")
 
+        # One pass detects both people (COCO class 0) and sports balls (class 32).
+        # TrackTrack + ReID handles crowded occlusions better than ByteTrack.
         results = self.model.track(
             source=str(path),
-            tracker="bytetrack.yaml",
-            classes=[0],
+            tracker=self.tracker_path,
+            classes=[0, 32],
             persist=True,
             device=self.device,
             stream=True,
             verbose=False,
-            conf=0.40,
+            conf=min(self.person_conf, self.ball_conf),
             iou=0.50,
         )
 
@@ -111,59 +221,85 @@ class PlayerTracker:
         detections_total = 0
         detections_inside_court = 0
         detections_outside_court = 0
+        ball_detections = 0
 
         for frame_index, result in enumerate(results):
             players: list[dict[str, Any]] = []
+            balls: list[dict[str, Any]] = []
 
-            if result.boxes is not None and result.boxes.id is not None:
+            if result.boxes is not None and len(result.boxes) > 0:
                 boxes = result.boxes.xyxy.cpu().tolist()
-                track_ids = result.boxes.id.int().cpu().tolist()
                 confidences = result.boxes.conf.cpu().tolist()
+                classes = result.boxes.cls.int().cpu().tolist()
+                if result.boxes.id is not None:
+                    ids = result.boxes.id.int().cpu().tolist()
+                else:
+                    ids = [-1] * len(boxes)
 
-                for box, track_id, confidence in zip(
-                    boxes, track_ids, confidences, strict=True
+                for box, raw_track_id, confidence, class_id in zip(
+                    boxes, ids, confidences, classes, strict=True
                 ):
-                    detections_total += 1
                     x1, y1, x2, y2 = (float(value) for value in box)
-                    foot_x = (x1 + x2) / 2.0
-                    foot_y = y2
-
-                    if not self._inside_court(foot_x, foot_y, court_polygon):
-                        detections_outside_court += 1
-                        continue
-
-                    detections_inside_court += 1
-                    track_frame_counts[track_id] = track_frame_counts.get(track_id, 0) + 1
-
-                    players.append(
-                        {
-                            "track_id": track_id,
-                            "confidence": round(float(confidence), 4),
-                            "box": {
-                                "x1": round(x1, 2),
-                                "y1": round(y1, 2),
-                                "x2": round(x2, 2),
-                                "y2": round(y2, 2),
-                            },
-                            "foot": {
-                                "x": round(foot_x, 2),
-                                "y": round(foot_y, 2),
-                            },
-                        }
-                    )
+                    confidence = float(confidence)
+                    if class_id == 0:
+                        if confidence < self.person_conf or raw_track_id < 0:
+                            continue
+                        detections_total += 1
+                        foot_x = (x1 + x2) / 2.0
+                        foot_y = y2
+                        if not self._inside_court(foot_x, foot_y, court_polygon):
+                            detections_outside_court += 1
+                            continue
+                        detections_inside_court += 1
+                        track_frame_counts[raw_track_id] = track_frame_counts.get(raw_track_id, 0) + 1
+                        court_position = self._project_point((foot_x, foot_y), court_transform)
+                        players.append(
+                            {
+                                "track_id": int(raw_track_id),
+                                "raw_track_id": int(raw_track_id),
+                                "confidence": round(confidence, 4),
+                                "box": {
+                                    "x1": round(x1, 2),
+                                    "y1": round(y1, 2),
+                                    "x2": round(x2, 2),
+                                    "y2": round(y2, 2),
+                                },
+                                "foot": {"x": round(foot_x, 2), "y": round(foot_y, 2)},
+                                "court_position": (
+                                    {"x": round(court_position[0], 5), "y": round(court_position[1], 5)}
+                                    if court_position is not None
+                                    else None
+                                ),
+                            }
+                        )
+                    elif class_id == 32 and confidence >= self.ball_conf:
+                        ball_detections += 1
+                        center_x = (x1 + x2) / 2.0
+                        center_y = (y1 + y2) / 2.0
+                        balls.append(
+                            {
+                                "confidence": round(confidence, 4),
+                                "box": {
+                                    "x1": round(x1, 2),
+                                    "y1": round(y1, 2),
+                                    "x2": round(x2, 2),
+                                    "y2": round(y2, 2),
+                                },
+                                "center": {"x": round(center_x, 2), "y": round(center_y, 2)},
+                            }
+                        )
 
             raw_frames.append(
                 {
                     "frame": frame_index,
                     "timestamp_seconds": round(frame_index / fps, 3),
                     "players": players,
+                    "balls": balls,
                 }
             )
 
             if progress_callback and (
-                frame_index == 0
-                or frame_index % 15 == 0
-                or frame_index + 1 >= reported_frame_count
+                frame_index == 0 or frame_index % 15 == 0 or frame_index + 1 >= reported_frame_count
             ):
                 progress_callback(
                     frame_index + 1,
@@ -171,75 +307,69 @@ class PlayerTracker:
                     f"Tracking frame {frame_index + 1} of {reported_frame_count}",
                 )
 
-        minimum_track_frames = max(5, int(fps * 0.25))
-        valid_track_ids = {
-            track_id
-            for track_id, count in track_frame_counts.items()
-            if count >= minimum_track_frames
+        minimum_track_frames = max(5, int(fps * 0.20))
+        valid_raw_ids = {
+            track_id for track_id, count in track_frame_counts.items() if count >= minimum_track_frames
         }
-
-        frames: list[dict[str, Any]] = []
-        unique_track_ids: set[int] = set()
+        filtered_raw_frames: list[dict[str, Any]] = []
         detections_removed_short_track = 0
-        detections_kept = 0
-
         for frame in raw_frames:
-            filtered_players: list[dict[str, Any]] = []
+            filtered_players = []
             for player in frame["players"]:
-                if player["track_id"] not in valid_track_ids:
+                if player["raw_track_id"] not in valid_raw_ids:
                     detections_removed_short_track += 1
                     continue
                 filtered_players.append(player)
+            filtered_raw_frames.append({**frame, "players": filtered_players})
+
+        id_mapping, stitching = self._stitch_track_ids(filtered_raw_frames, fps, width, height)
+        frames: list[dict[str, Any]] = []
+        stable_ids: set[int] = set()
+        detections_kept = 0
+        stable_track_lengths: dict[int, int] = {}
+        for frame in filtered_raw_frames:
+            players = []
+            for player in frame["players"]:
+                stable_id = id_mapping.get(int(player["raw_track_id"]), int(player["raw_track_id"]))
+                updated = {**player, "track_id": stable_id}
+                players.append(updated)
                 detections_kept += 1
-                unique_track_ids.add(player["track_id"])
+                stable_ids.add(stable_id)
+                stable_track_lengths[stable_id] = stable_track_lengths.get(stable_id, 0) + 1
+            frames.append({**frame, "players": players})
 
-            frames.append(
-                {
-                    "frame": frame["frame"],
-                    "timestamp_seconds": frame["timestamp_seconds"],
-                    "players": filtered_players,
-                }
-            )
-
-        processed_frame_count = len(frames)
-        duration_seconds = processed_frame_count / fps if fps > 0 else 0.0
-        track_lengths = {
-            str(track_id): count
-            for track_id, count in sorted(
-                track_frame_counts.items(), key=lambda item: item[1], reverse=True
-            )
-            if track_id in valid_track_ids
-        }
-
+        duration_seconds = len(frames) / fps if fps > 0 else 0.0
         print(
             "[player-tracker] Complete: "
-            f"total_detections={detections_total} "
-            f"inside={detections_inside_court} "
-            f"outside={detections_outside_court} "
-            f"kept={detections_kept} "
-            f"unique_tracks={len(unique_track_ids)}",
+            f"raw_tracks={stitching['raw_track_count']} stable_tracks={len(stable_ids)} "
+            f"stitched={stitching['stitched_track_count']} ball_detections={ball_detections}",
             flush=True,
         )
 
         return {
             "status": "complete",
             "device": self.device,
+            "tracker": Path(self.tracker_path).name,
             "video_path": str(path),
             "fps": round(fps, 3),
             "width": width,
             "height": height,
             "reported_frame_count": reported_frame_count,
-            "frame_count": processed_frame_count,
+            "frame_count": len(frames),
             "duration_seconds": round(duration_seconds, 3),
             "court_filter_enabled": court_polygon is not None,
             "court_points_pixels": court_polygon.tolist() if court_polygon is not None else None,
             "minimum_track_frames": minimum_track_frames,
-            "unique_track_count": len(unique_track_ids),
+            "raw_unique_track_count": stitching["raw_track_count"],
+            "unique_track_count": len(stable_ids),
+            "stitched_track_count": stitching["stitched_track_count"],
+            "stitching": stitching,
             "detections_total": detections_total,
             "detections_inside_court": detections_inside_court,
             "detections_removed_outside_court": detections_outside_court,
             "detections_removed_short_track": detections_removed_short_track,
             "detections_kept": detections_kept,
-            "track_lengths": track_lengths,
+            "ball_detections": ball_detections,
+            "track_lengths": {str(k): v for k, v in sorted(stable_track_lengths.items())},
             "frames": frames,
         }

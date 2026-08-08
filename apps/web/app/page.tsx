@@ -17,6 +17,11 @@ type Touch = {
   outcome: string;
   notes: string;
   confidence: number;
+  source?: string;
+  reviewed?: boolean;
+  track_id?: number | null;
+  ball_frame?: number | null;
+  features?: Record<string, number> | null;
 };
 
 type Rally = {
@@ -37,10 +42,17 @@ type TrackingPlayer = {
   foot: { x: number; y: number };
 };
 
+type TrackingBall = {
+  confidence: number;
+  box: { x1: number; y1: number; x2: number; y2: number };
+  center: { x: number; y: number };
+};
+
 type TrackingFrame = {
   frame: number;
   timestamp_seconds: number;
   players: TrackingPlayer[];
+  balls?: TrackingBall[];
 };
 
 type TrackingResult = {
@@ -53,6 +65,10 @@ type TrackingResult = {
   reported_frame_count: number;
   duration_seconds: number;
   unique_track_count: number;
+  raw_unique_track_count?: number;
+  stitched_track_count?: number;
+  ball_detections?: number;
+  tracker?: string;
   detections_total: number;
   detections_inside_court: number;
   detections_removed_outside_court: number;
@@ -106,6 +122,7 @@ type JobResponse = {
     model_version: string;
     rallies: Rally[];
     tracking?: TrackingResult;
+    action_diagnostics?: { ball_observations?: number; contact_candidates?: number; message?: string };
   } | null;
 };
 
@@ -182,6 +199,7 @@ export default function Home() {
   const [analyzeStatus, setAnalyzeStatus] = useState("AI worker not run yet");
   const [tracking, setTracking] = useState<TrackingResult | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
+  const [feedbackStatus, setFeedbackStatus] = useState("Review AI action candidates below.");
 
   const [tagPlayer, setTagPlayer] = useState("#12");
   const [tagAction, setTagAction] = useState("attack");
@@ -252,6 +270,60 @@ export default function Home() {
   function updateMatch(updated: Match) {
     setSelected(updated);
     setMatches((previous) => previous.map((match) => (match.id === updated.id ? updated : match)));
+  }
+
+  async function saveTrainingFeedback(original: Touch, corrected: Touch) {
+    if (!selected) return;
+    try {
+      setFeedbackStatus("Saving reviewed label to the training set...");
+      const response = await fetch("/api/training-feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          schema_version: 1,
+          created_at: new Date().toISOString(),
+          match_id: selected.id,
+          title: selected.title,
+          opponent: selected.opponent,
+          video_url: selected.video_url,
+          filename: selected.filename,
+          court_calibration: selected.court_calibration,
+          touch_id: corrected.id,
+          clip: { start_time: corrected.start_time, end_time: corrected.end_time },
+          model_version: selected.status.startsWith("AI analyzed: ") ? selected.status.replace("AI analyzed: ", "") : "manual",
+          original_prediction: {
+            action: original.action,
+            player: original.player,
+            outcome: original.outcome,
+            confidence: original.confidence,
+            track_id: original.track_id,
+            features: original.features,
+          },
+          corrected_label: {
+            action: corrected.action,
+            player: corrected.player,
+            outcome: corrected.outcome,
+            track_id: corrected.track_id,
+          },
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not save training label.");
+      setFeedbackStatus("Saved. This reviewed example is now in your training-feedback dataset.");
+    } catch (error) {
+      setFeedbackStatus(error instanceof Error ? `Label saved locally, but cloud training save failed: ${error.message}` : "Cloud training save failed.");
+    }
+  }
+
+  async function reviewTouch(original: Touch, changes: Partial<Touch>) {
+    if (!selected) return;
+    const corrected: Touch = { ...original, ...changes, reviewed: true };
+    const rallies = selected.rallies.map((rally) => ({
+      ...rally,
+      touches: rally.touches.map((touch) => touch.id === original.id ? corrected : touch),
+    }));
+    updateMatch({ ...selected, rallies });
+    await saveTrainingFeedback(original, corrected);
   }
 
   function beginCourtCalibration() {
@@ -430,6 +502,8 @@ export default function Home() {
       updateMatch(updated);
       setAnalyzeProgress(100);
       setAnalyzeStatus(result.message || "AI tracking complete.");
+      const candidateCount = result.action_diagnostics?.contact_candidates ?? result.rallies?.flatMap((rally) => rally.touches).length ?? 0;
+      setFeedbackStatus(candidateCount ? `AI proposed ${candidateCount} action candidate${candidateCount === 1 ? "" : "s"}. Review and approve/correct them below.` : (result.action_diagnostics?.message || "No action candidates found. Manual labels are still useful training data."));
       return;
     }
 
@@ -497,7 +571,7 @@ export default function Home() {
     if (selected?.id === match.id) setSelected(remaining[0] || null);
   }
 
-  function addManualTouch() {
+  async function addManualTouch() {
     if (!selected) return;
     const start = videoRef.current?.currentTime || 0;
     const rallyId = Date.now();
@@ -509,8 +583,10 @@ export default function Home() {
       action: tagAction,
       player: tagPlayer,
       outcome: tagOutcome,
-      notes: "Manual user tag — not generated by the current AI model.",
+      notes: "Manual user tag — reviewed ground-truth training label.",
       confidence: 1,
+      source: "manual",
+      reviewed: true,
     };
     const rally: Rally = {
       id: rallyId,
@@ -523,6 +599,7 @@ export default function Home() {
       touches: [touch],
     };
     updateMatch({ ...selected, rallies: [...selected.rallies, rally].sort((a, b) => a.start_time - b.start_time) });
+    await saveTrainingFeedback(touch, touch);
   }
 
   const summary = tracking ? trackingSummary(tracking) : selected?.tracking_summary;
@@ -533,7 +610,7 @@ export default function Home() {
         <div className="mb-8 rounded-3xl bg-gradient-to-r from-blue-600 to-cyan-500 p-8 shadow-2xl">
           <p className="text-sm uppercase tracking-widest text-blue-100">Volleyball AI Video Analysis</p>
           <h1 className="mt-2 text-5xl font-black">VolleyVision AI</h1>
-          <p className="mt-3 max-w-3xl text-blue-50">Real court-filtered YOLO + ByteTrack analysis with background processing. Automatic volleyball touch recognition comes after a trained ball/action model is added.</p>
+          <p className="mt-3 max-w-3xl text-blue-50">Court-filtered person + ball tracking, occlusion-aware identity stitching, experimental action candidates, and a human-review training loop.</p>
         </div>
 
         <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
@@ -557,7 +634,7 @@ export default function Home() {
 
             <div className="rounded-2xl bg-white/10 p-5 shadow-xl ring-1 ring-white/10">
               <h2 className="text-xl font-bold">Roster</h2>
-              <p className="mt-1 text-sm text-white/60">Saved for future jersey/action identity models. Current tracking uses anonymous track IDs.</p>
+              <p className="mt-1 text-sm text-white/60">Roster metadata can later map stable track IDs to jersey/player identities. Tracking now uses occlusion-aware ReID plus track stitching.</p>
               <div className="mt-3 space-y-2">
                 {roster.map((player, index) => (
                   <div key={index} className="grid grid-cols-[56px_1fr] gap-2 rounded-xl bg-white/5 p-2">
@@ -626,6 +703,13 @@ export default function Home() {
                             );
                           })}
 
+                          {tracking && currentTrackingFrame?.balls?.map((ball, index) => (
+                            <g key={`ball-${currentTrackingFrame.frame}-${index}`}>
+                              <circle cx={ball.center.x / tracking.width} cy={ball.center.y / tracking.height} r="0.012" fill="rgba(250,204,21,0.35)" stroke="rgb(250,204,21)" strokeWidth="0.004" vectorEffect="non-scaling-stroke" />
+                              <text x={ball.center.x / tracking.width + 0.014} y={ball.center.y / tracking.height} fill="rgb(254,240,138)" fontSize="0.022" fontWeight="800">BALL</text>
+                            </g>
+                          ))}
+
                           {courtPoints.map((point, index) => (
                             <g key={`${index}-${point.x}-${point.y}`}>
                               <circle cx={point.x} cy={point.y} r="0.018" fill="rgb(250,204,21)" stroke="white" strokeWidth="0.004" vectorEffect="non-scaling-stroke" />
@@ -663,15 +747,15 @@ export default function Home() {
                 </div>
 
                 <div className="grid gap-4 md:grid-cols-4">
-                  <Stat label="Persistent track IDs" value={String(summary?.unique_track_count ?? 0)} />
-                  <Stat label="Detections kept" value={String(summary?.detections_kept ?? 0)} />
+                  <Stat label="Stable player IDs" value={String(summary?.unique_track_count ?? 0)} />
+                  <Stat label="Ball detections" value={String(tracking?.ball_detections ?? 0)} />
                   <Stat label="Off-court removed" value={String(summary?.detections_removed_outside_court ?? 0)} />
                   <Stat label="Frames tracked" value={String(summary?.frame_count ?? 0)} />
                 </div>
 
                 <div className="rounded-2xl bg-white/10 p-5 shadow-xl ring-1 ring-white/10">
-                  <h2 className="text-xl font-bold">Manual touch annotation</h2>
-                  <p className="mt-1 text-sm text-white/60">Use this to create training/reference labels. These are intentionally separate from the current player-tracking AI.</p>
+                  <h2 className="text-xl font-bold">Add a missed action</h2>
+                  <p className="mt-1 text-sm text-white/60">If AI misses a serve, pass, set, attack, dig, or block, add it here. Manual labels are saved as reviewed training examples.</p>
                   <div className="mt-3 grid gap-2 md:grid-cols-4">
                     <input className="rounded bg-white/10 p-2" value={tagPlayer} onChange={(e) => setTagPlayer(e.target.value)} placeholder="#12" />
                     <input className="rounded bg-white/10 p-2" value={tagAction} onChange={(e) => setTagAction(e.target.value)} placeholder="serve / receive / set / attack / dig / block" />
@@ -681,18 +765,21 @@ export default function Home() {
                 </div>
 
                 <div className="rounded-2xl bg-white/10 p-5 shadow-xl ring-1 ring-white/10">
-                  <h2 className="text-xl font-bold">Touch labels</h2>
-                  <p className="mt-1 text-sm text-white/60">Automatic serve/receive/set/attack/dig/block recognition is not enabled until you train and connect a ball/action model. Current entries below are manual labels only.</p>
+                  <div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="text-xl font-bold">AI action review</h2><p className="mt-1 text-sm text-white/60">AI suggestions are experimental. Correct them here; every saved review becomes durable training data in Vercel Blob.</p></div><a className="rounded-lg bg-white/10 px-3 py-2 text-xs font-bold hover:bg-white/20" href="/api/training-feedback" target="_blank">Training feedback index</a></div>
+                  <p className="mt-3 rounded-lg bg-cyan-950/40 p-2 text-sm text-cyan-100">{feedbackStatus}</p>
                   <div className="mt-4 max-h-[420px] overflow-auto rounded-xl border border-white/10">
                     <table className="w-full text-sm">
-                      <thead className="sticky top-0 bg-slate-900 text-left"><tr><th className="p-3">Time</th><th>Action</th><th>Player</th><th>Outcome</th></tr></thead>
+                      <thead className="sticky top-0 bg-slate-900 text-left"><tr><th className="p-3">Time</th><th>Action</th><th>Player</th><th>Outcome</th><th>AI conf.</th><th>Review</th></tr></thead>
                       <tbody>
                         {allTouches.map((touch) => (
-                          <tr key={touch.id} className="border-t border-white/10 cursor-pointer hover:bg-white/5" onClick={() => { if (videoRef.current) { videoRef.current.currentTime = touch.start_time; } }}>
-                            <td className="p-3 text-cyan-200">{formatTime(touch.start_time)}</td><td>{touch.action}</td><td>{touch.player}</td><td>{touch.outcome}</td>
-                          </tr>
+                          <TouchReviewRow
+                            key={touch.id}
+                            touch={touch}
+                            onJump={() => { if (videoRef.current) videoRef.current.currentTime = touch.start_time; }}
+                            onSave={(changes) => reviewTouch(touch, changes)}
+                          />
                         ))}
-                        {!allTouches.length && <tr><td className="p-4 text-white/50" colSpan={4}>No touch labels yet.</td></tr>}
+                        {!allTouches.length && <tr><td className="p-4 text-white/50" colSpan={6}>No action candidates yet. If the generic YOLO model misses the volleyball, add the actions manually; those labels are exactly what we need to train a volleyball-specific model.</td></tr>}
                       </tbody>
                     </table>
                   </div>
@@ -703,6 +790,31 @@ export default function Home() {
         </div>
       </section>
     </main>
+  );
+}
+
+function TouchReviewRow({ touch, onJump, onSave }: { touch: Touch; onJump: () => void; onSave: (changes: Partial<Touch>) => Promise<void> }) {
+  const [action, setAction] = useState(touch.action);
+  const [player, setPlayer] = useState(touch.player);
+  const [outcome, setOutcome] = useState(touch.outcome);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => { setAction(touch.action); setPlayer(touch.player); setOutcome(touch.outcome); }, [touch.action, touch.player, touch.outcome]);
+
+  async function save() {
+    setSaving(true);
+    try { await onSave({ action, player, outcome }); } finally { setSaving(false); }
+  }
+
+  return (
+    <tr className="border-t border-white/10 hover:bg-white/5">
+      <td className="p-3 text-cyan-200"><button onClick={onJump} className="font-bold hover:underline">{formatTime(touch.start_time)}</button></td>
+      <td><select value={action} onChange={(e) => setAction(e.target.value)} className="rounded bg-slate-800 p-2"><option>serve</option><option>pass</option><option>set</option><option>attack</option><option>dig</option><option>block</option><option>touch</option></select></td>
+      <td><input value={player} onChange={(e) => setPlayer(e.target.value)} className="w-24 rounded bg-slate-800 p-2" /></td>
+      <td><input value={outcome} onChange={(e) => setOutcome(e.target.value)} className="w-32 rounded bg-slate-800 p-2" /></td>
+      <td>{Math.round(touch.confidence * 100)}%</td>
+      <td><button onClick={save} disabled={saving} className={`rounded px-3 py-2 text-xs font-bold ${touch.reviewed ? "bg-green-500/70" : "bg-amber-300 text-slate-950"}`}>{saving ? "Saving..." : touch.reviewed ? "Reviewed" : "Approve / save"}</button></td>
+    </tr>
   );
 }
 
