@@ -17,10 +17,10 @@ from app.player_tracker import PlayerTracker
 from app.action_detector import detect_actions
 from app.schemas import AnalyzeRequest, AnalyzeResponse, CourtPoint
 
-MODEL_VERSION = "volleyvision-active-learning-v0.3"
+MODEL_VERSION = "volleyvision-ball-training-v0.4"
 JOB_TTL_SECONDS = 6 * 60 * 60
 
-app = FastAPI(title="VolleyVision AI Worker", version="0.3.0")
+app = FastAPI(title="VolleyVision AI Worker", version="0.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

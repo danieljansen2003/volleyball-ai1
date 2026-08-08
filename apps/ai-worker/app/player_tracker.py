@@ -21,6 +21,9 @@ class PlayerTracker:
         if not model_path.exists():
             print("[player-tracker] Local yolo11n.pt not found; asking Ultralytics to download the official weight file.", flush=True)
         self.model = YOLO(model_source)
+        ball_model_path = worker_root / "models" / "volleyball-ball.pt"
+        self.ball_model_path = ball_model_path
+        self.ball_model = YOLO(str(ball_model_path)) if ball_model_path.exists() else None
         self.device = "mps" if torch.backends.mps.is_available() else "cpu"
         tracker_path = Path(__file__).resolve().parent / "trackers" / "volleyball_tracktrack.yaml"
         self.tracker_path = str(tracker_path)
@@ -29,9 +32,17 @@ class PlayerTracker:
         self.stitch_gap_seconds = float(os.getenv("VV_STITCH_GAP_SECONDS", "3.0"))
         self.stitch_distance = float(os.getenv("VV_STITCH_DISTANCE", "0.22"))
         print(
-            f"[player-tracker] Loaded YOLO on device={self.device} tracker={tracker_path.name}",
+            f"[player-tracker] Loaded player YOLO on device={self.device} tracker={tracker_path.name}",
             flush=True,
         )
+        if self.ball_model is not None:
+            print(f"[player-tracker] Loaded custom volleyball detector: {ball_model_path}", flush=True)
+        else:
+            print(
+                f"[player-tracker] No custom volleyball detector yet at {ball_model_path}. "
+                "Ball detections will remain 0 until you train and deploy volleyball-ball.pt.",
+                flush=True,
+            )
 
     @staticmethod
     def _build_court_polygon(
@@ -200,19 +211,19 @@ class PlayerTracker:
         )
 
         if progress_callback:
-            progress_callback(0, max(1, reported_frame_count), "Starting person + ball detector")
+            progress_callback(0, max(1, reported_frame_count), "Tracking players")
 
-        # One pass detects both people (COCO class 0) and sports balls (class 32).
-        # TrackTrack + ReID handles crowded occlusions better than ByteTrack.
+        # Player tracking is kept separate from volleyball detection. The production ball
+        # model is a custom single-class detector trained from VolleyVision labels.
         results = self.model.track(
             source=str(path),
             tracker=self.tracker_path,
-            classes=[0, 32],
+            classes=[0],
             persist=True,
             device=self.device,
             stream=True,
             verbose=False,
-            conf=min(self.person_conf, self.ball_conf),
+            conf=self.person_conf,
             iou=0.50,
         )
 
@@ -270,22 +281,6 @@ class PlayerTracker:
                                     if court_position is not None
                                     else None
                                 ),
-                            }
-                        )
-                    elif class_id == 32 and confidence >= self.ball_conf:
-                        ball_detections += 1
-                        center_x = (x1 + x2) / 2.0
-                        center_y = (y1 + y2) / 2.0
-                        balls.append(
-                            {
-                                "confidence": round(confidence, 4),
-                                "box": {
-                                    "x1": round(x1, 2),
-                                    "y1": round(y1, 2),
-                                    "x2": round(x2, 2),
-                                    "y2": round(y2, 2),
-                                },
-                                "center": {"x": round(center_x, 2), "y": round(center_y, 2)},
                             }
                         )
 
@@ -370,6 +365,8 @@ class PlayerTracker:
             "detections_removed_short_track": detections_removed_short_track,
             "detections_kept": detections_kept,
             "ball_detections": ball_detections,
+            "ball_model": str(self.ball_model_path) if self.ball_model is not None else None,
+            "ball_model_ready": self.ball_model is not None,
             "track_lengths": {str(k): v for k, v in sorted(stable_track_lengths.items())},
             "frames": frames,
         }

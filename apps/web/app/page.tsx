@@ -6,6 +6,7 @@ import type { MouseEvent } from "react";
 
 type CourtPoint = { x: number; y: number };
 type CourtCalibration = { points: CourtPoint[]; confirmed: boolean; frame_time: number };
+type BallLabelBox = { x: number; y: number; width: number; height: number };
 
 type Touch = {
   id: number;
@@ -176,6 +177,7 @@ export default function Home() {
   const uploadStartedAtRef = useRef(0);
   const localPreviewUrlsRef = useRef<string[]>([]);
   const pollCancelledRef = useRef(false);
+  const ballDragStartRef = useRef<CourtPoint | null>(null);
 
   const [matches, setMatches] = useState<Match[]>([]);
   const [libraryReady, setLibraryReady] = useState(false);
@@ -200,6 +202,11 @@ export default function Home() {
   const [tracking, setTracking] = useState<TrackingResult | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [feedbackStatus, setFeedbackStatus] = useState("Review AI action candidates below.");
+  const [ballLabelMode, setBallLabelMode] = useState(false);
+  const [ballLabelBox, setBallLabelBox] = useState<BallLabelBox | null>(null);
+  const [ballLabelSaving, setBallLabelSaving] = useState(false);
+  const [ballLabelStatus, setBallLabelStatus] = useState("Pause on a clear frame, draw a tight box around the volleyball, then save it.");
+  const [ballTrainingCount, setBallTrainingCount] = useState(0);
 
   const [tagPlayer, setTagPlayer] = useState("#12");
   const [tagAction, setTagAction] = useState("attack");
@@ -229,6 +236,13 @@ export default function Home() {
   }, [roster]);
 
   useEffect(() => {
+    fetch("/api/ball-labels", { cache: "no-store" })
+      .then((response) => response.json())
+      .then((data) => { if (data?.ok) setBallTrainingCount(Number(data.count || 0)); })
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
     if (!libraryReady) return;
     saveMatchLibrary(matches);
     const total = matches.reduce((sum, match) => sum + (match.file_size || 0), 0);
@@ -249,6 +263,9 @@ export default function Home() {
     setCourtPoints(Array.isArray(savedPoints) ? savedPoints.filter((point) => Number.isFinite(point?.x) && Number.isFinite(point?.y)).slice(0, 4) : []);
     setCourtConfirmed(Boolean(selected?.court_calibration?.confirmed));
     setCourtCalibrationMode(false);
+    setBallLabelMode(false);
+    setBallLabelBox(null);
+    ballDragStartRef.current = null;
   }, [selected?.id]);
 
   const sortedRallies = useMemo(
@@ -326,9 +343,107 @@ export default function Home() {
     await saveTrainingFeedback(original, corrected);
   }
 
+  function beginBallLabeling() {
+    if (!selected || !videoRef.current) return;
+    videoRef.current.pause();
+    setCourtCalibrationMode(false);
+    setBallLabelMode(true);
+    setBallLabelBox(null);
+    ballDragStartRef.current = null;
+    setBallLabelStatus("Drag a tight rectangle around the volleyball on this paused frame.");
+  }
+
+  function normalizedPointFromElement(event: { clientX: number; clientY: number }, element: HTMLElement): CourtPoint {
+    const rect = element.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width))),
+      y: Math.max(0, Math.min(1, (event.clientY - rect.top) / Math.max(1, rect.height))),
+    };
+  }
+
+  function startBallBox(event: React.PointerEvent<HTMLDivElement>) {
+    if (!ballLabelMode) return;
+    event.preventDefault();
+    const point = normalizedPointFromElement(event, event.currentTarget);
+    ballDragStartRef.current = point;
+    setBallLabelBox({ x: point.x, y: point.y, width: 0, height: 0 });
+  }
+
+  function updateBallBox(event: React.PointerEvent<HTMLDivElement>) {
+    const start = ballDragStartRef.current;
+    if (!ballLabelMode || !start) return;
+    const end = normalizedPointFromElement(event, event.currentTarget);
+    setBallLabelBox({
+      x: Math.min(start.x, end.x),
+      y: Math.min(start.y, end.y),
+      width: Math.abs(end.x - start.x),
+      height: Math.abs(end.y - start.y),
+    });
+  }
+
+  function finishBallBox(event: React.PointerEvent<HTMLDivElement>) {
+    if (!ballLabelMode || !ballDragStartRef.current) return;
+    updateBallBox(event);
+    ballDragStartRef.current = null;
+  }
+
+  async function saveBallLabel() {
+    if (!selected || !videoRef.current || !ballLabelBox) return;
+    if (ballLabelBox.width < 0.002 || ballLabelBox.height < 0.002) {
+      return alert("Draw a box around the volleyball first.");
+    }
+
+    const video = videoRef.current;
+    if (!video.videoWidth || !video.videoHeight) return alert("Video frame is not ready yet.");
+
+    setBallLabelSaving(true);
+    setBallLabelStatus("Saving frame + YOLO label to the training dataset...");
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("Could not create frame canvas.");
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((value) => value ? resolve(value) : reject(new Error("Could not encode frame image.")), "image/jpeg", 0.94);
+      });
+
+      const sampleId = `${selected.id}-${Math.round(video.currentTime * 1000)}-${Date.now()}`;
+      const form = new FormData();
+      form.append("image", new File([blob], `${sampleId}.jpg`, { type: "image/jpeg" }));
+      form.append("match_id", String(selected.id));
+      form.append("sample_id", sampleId);
+      form.append("timestamp_seconds", String(video.currentTime));
+      form.append("video_url", selected.video_url);
+      form.append("filename", selected.filename);
+      form.append("frame_width", String(video.videoWidth));
+      form.append("frame_height", String(video.videoHeight));
+      form.append("x", String(ballLabelBox.x));
+      form.append("y", String(ballLabelBox.y));
+      form.append("width", String(ballLabelBox.width));
+      form.append("height", String(ballLabelBox.height));
+
+      const response = await fetch("/api/ball-labels", { method: "POST", body: form });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not save ball label.");
+      setBallTrainingCount((count) => count + 1);
+      setBallLabelStatus(`Saved training sample #${ballTrainingCount + 1}. Move to another frame and label the ball again.`);
+      setBallLabelBox(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not save ball label.";
+      setBallLabelStatus(message);
+      alert(message);
+    } finally {
+      setBallLabelSaving(false);
+    }
+  }
+
   function beginCourtCalibration() {
     if (!selected || !videoRef.current) return;
     videoRef.current.pause();
+    setBallLabelMode(false);
+    setBallLabelBox(null);
     setCourtCalibrationMode(true);
     setCourtConfirmed(false);
     setCourtPoints([]);
@@ -610,7 +725,7 @@ export default function Home() {
         <div className="mb-8 rounded-3xl bg-gradient-to-r from-blue-600 to-cyan-500 p-8 shadow-2xl">
           <p className="text-sm uppercase tracking-widest text-blue-100">Volleyball AI Video Analysis</p>
           <h1 className="mt-2 text-5xl font-black">VolleyVision AI</h1>
-          <p className="mt-3 max-w-3xl text-blue-50">Court-filtered person + ball tracking, occlusion-aware identity stitching, experimental action candidates, and a human-review training loop.</p>
+          <p className="mt-3 max-w-3xl text-blue-50">Court-filtered player tracking, built-in volleyball box labeling, a persistent YOLO ball-training dataset, and human-reviewed action labels.</p>
         </div>
 
         <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
@@ -674,16 +789,24 @@ export default function Home() {
                       <p className="text-white/70">vs {selected.opponent} · {formatTime(selected.duration_seconds)} · {selected.status}</p>
                     </div>
                     <div className="flex flex-wrap gap-2">
-                      <button onClick={beginCourtCalibration} disabled={analyzing} className="rounded-xl bg-amber-300 px-4 py-2 font-bold text-slate-950 disabled:opacity-50">{courtConfirmed ? "Edit court" : "Set court"}</button>
-                      <button disabled={analyzing || selected.video_url.startsWith("blob:") || !courtConfirmed} onClick={() => runAiWorker(selected)} className="rounded-xl bg-purple-400 px-4 py-2 font-bold text-slate-950 disabled:opacity-50">{analyzing ? `AI ${analyzeProgress}%` : "Run AI worker"}</button>
+                      <button onClick={beginCourtCalibration} disabled={analyzing || ballLabelMode} className="rounded-xl bg-amber-300 px-4 py-2 font-bold text-slate-950 disabled:opacity-50">{courtConfirmed ? "Edit court" : "Set court"}</button>
+                      <button onClick={beginBallLabeling} disabled={analyzing || courtCalibrationMode} className="rounded-xl bg-yellow-300 px-4 py-2 font-bold text-slate-950 disabled:opacity-50">Label volleyball</button>
+                      <button disabled={analyzing || selected.video_url.startsWith("blob:") || !courtConfirmed || ballLabelMode} onClick={() => runAiWorker(selected)} className="rounded-xl bg-purple-400 px-4 py-2 font-bold text-slate-950 disabled:opacity-50">{analyzing ? `AI ${analyzeProgress}%` : "Run AI worker"}</button>
                     </div>
                   </div>
 
                   <div className="relative mt-5 overflow-hidden rounded-xl bg-black">
-                    <video ref={videoRef} className="block w-full bg-black" controls={!courtCalibrationMode} playsInline preload="metadata" src={selected.local_preview_url || selected.video_url} onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)} />
+                    <video ref={videoRef} className="block w-full bg-black" controls={!courtCalibrationMode && !ballLabelMode} playsInline preload="metadata" src={selected.local_preview_url || selected.video_url} onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)} />
 
-                    {(courtCalibrationMode || courtPoints.length > 0 || currentTrackingFrame) && (
-                      <div className={`absolute inset-0 ${courtCalibrationMode ? "cursor-crosshair" : "pointer-events-none"}`} onClick={addCourtCorner}>
+                    {(courtCalibrationMode || ballLabelMode || courtPoints.length > 0 || currentTrackingFrame) && (
+                      <div
+                        className={`absolute inset-0 ${courtCalibrationMode ? "cursor-crosshair" : ballLabelMode ? "cursor-crosshair touch-none" : "pointer-events-none"}`}
+                        onClick={courtCalibrationMode ? addCourtCorner : undefined}
+                        onPointerDown={ballLabelMode ? startBallBox : undefined}
+                        onPointerMove={ballLabelMode ? updateBallBox : undefined}
+                        onPointerUp={ballLabelMode ? finishBallBox : undefined}
+                        onPointerCancel={ballLabelMode ? finishBallBox : undefined}
+                      >
                         <svg className="h-full w-full" viewBox="0 0 1 1" preserveAspectRatio="none">
                           {courtPoints.length >= 2 && (
                             <polyline points={[...courtPoints, ...(courtPoints.length === 4 ? [courtPoints[0]] : [])].map((point) => `${point.x},${point.y}`).join(" ")} fill={courtPoints.length === 4 ? "rgba(34,211,238,0.10)" : "none"} stroke="rgb(34,211,238)" strokeWidth="0.004" vectorEffect="non-scaling-stroke" />
@@ -710,6 +833,13 @@ export default function Home() {
                             </g>
                           ))}
 
+                          {ballLabelBox && (
+                            <g>
+                              <rect x={ballLabelBox.x} y={ballLabelBox.y} width={ballLabelBox.width} height={ballLabelBox.height} fill="rgba(250,204,21,0.12)" stroke="rgb(250,204,21)" strokeWidth="0.005" vectorEffect="non-scaling-stroke" />
+                              <text x={ballLabelBox.x} y={Math.max(0.025, ballLabelBox.y - 0.012)} fill="rgb(254,240,138)" fontSize="0.026" fontWeight="800">VOLLEYBALL LABEL</text>
+                            </g>
+                          )}
+
                           {courtPoints.map((point, index) => (
                             <g key={`${index}-${point.x}-${point.y}`}>
                               <circle cx={point.x} cy={point.y} r="0.018" fill="rgb(250,204,21)" stroke="white" strokeWidth="0.004" vectorEffect="non-scaling-stroke" />
@@ -733,6 +863,24 @@ export default function Home() {
                     </div>
                   )}
 
+                  {ballLabelMode && (
+                    <div className="mt-3 rounded-xl bg-yellow-950/50 p-4 ring-1 ring-yellow-300/30">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <div className="font-bold text-yellow-100">Ball training mode · {ballTrainingCount} saved samples</div>
+                          <p className="mt-1 text-sm text-yellow-100/75">Pause on a frame where the ball is visible. Drag a tight box around the volleyball. Save it. Then scrub to another useful frame and repeat.</p>
+                        </div>
+                        <a href="/api/ball-labels" target="_blank" className="rounded-lg bg-white/10 px-3 py-2 text-xs font-bold">Dataset index</a>
+                      </div>
+                      <p className="mt-3 rounded-lg bg-black/20 p-2 text-sm text-yellow-100">{ballLabelStatus}</p>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button onClick={() => setBallLabelBox(null)} className="rounded-lg bg-white/15 px-3 py-2 text-sm font-bold">Clear box</button>
+                        <button disabled={!ballLabelBox || ballLabelSaving} onClick={saveBallLabel} className="rounded-lg bg-yellow-300 px-3 py-2 text-sm font-bold text-slate-950 disabled:opacity-40">{ballLabelSaving ? "Saving..." : "Save volleyball label"}</button>
+                        <button onClick={() => { setBallLabelMode(false); setBallLabelBox(null); ballDragStartRef.current = null; }} className="rounded-lg bg-white/15 px-3 py-2 text-sm font-bold">Done labeling</button>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="mt-3 rounded-xl bg-purple-950/40 p-3 text-sm text-purple-100 ring-1 ring-purple-300/20">
                     <div className="flex justify-between gap-3"><strong>AI worker</strong><span>{analyzing ? `${analyzeProgress}%` : ""}</span></div>
                     <p className="mt-1">{analyzeStatus}</p>
@@ -746,9 +894,10 @@ export default function Home() {
                   </div>
                 </div>
 
-                <div className="grid gap-4 md:grid-cols-4">
+                <div className="grid gap-4 md:grid-cols-5">
                   <Stat label="Stable player IDs" value={String(summary?.unique_track_count ?? 0)} />
                   <Stat label="Ball detections" value={String(tracking?.ball_detections ?? 0)} />
+                  <Stat label="Ball training samples" value={String(ballTrainingCount)} />
                   <Stat label="Off-court removed" value={String(summary?.detections_removed_outside_court ?? 0)} />
                   <Stat label="Frames tracked" value={String(summary?.frame_count ?? 0)} />
                 </div>
