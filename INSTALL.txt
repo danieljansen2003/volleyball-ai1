@@ -1,0 +1,15 @@
+VolleyVision local-Mac AI worker v6
+
+Copy this folder's contents over the matching paths in your existing ~/Documents/volleyball-ai1 project.
+It intentionally DOES NOT contain or replace your model weights, saved data, package-lock files, or Vercel Blob data.
+
+Files replaced/added:
+- apps/web/app/api/analyze/route.ts
+- apps/web/app/page.tsx
+- apps/ai-worker/app/main.py
+- apps/ai-worker/app/player_tracker.py
+- scripts/local_ai_worker.py
+- .env.local-worker.example
+- LOCAL_MAC_AI_WORKER_README.md
+
+After copying, follow LOCAL_MAC_AI_WORKER_README.md.

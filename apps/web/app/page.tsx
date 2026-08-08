@@ -689,7 +689,7 @@ export default function Home() {
     pollCancelledRef.current = true;
     setAnalyzing(true);
     setAnalyzeProgress(0);
-    setAnalyzeStatus("Starting background AI job...");
+    setAnalyzeStatus("Queuing job for your local Mac AI worker...");
     setTracking(null);
 
     try {
@@ -844,7 +844,7 @@ export default function Home() {
                     <div className="flex flex-wrap gap-2">
                       <button onClick={beginCourtCalibration} disabled={analyzing || ballLabelMode} className="rounded-xl bg-amber-300 px-4 py-2 font-bold text-slate-950 disabled:opacity-50">{courtConfirmed ? "Edit court" : "Set court"}</button>
                       <button onClick={beginBallLabeling} disabled={analyzing || courtCalibrationMode} className="rounded-xl bg-yellow-300 px-4 py-2 font-bold text-slate-950 disabled:opacity-50">Label volleyball</button>
-                      <button disabled={analyzing || selected.video_url.startsWith("blob:") || !courtConfirmed || ballLabelMode} onClick={() => runAiWorker(selected)} className="rounded-xl bg-purple-400 px-4 py-2 font-bold text-slate-950 disabled:opacity-50">{analyzing ? `AI ${analyzeProgress}%` : "Run AI worker"}</button>
+                      <button disabled={analyzing || selected.video_url.startsWith("blob:") || !courtConfirmed || ballLabelMode} onClick={() => runAiWorker(selected)} className="rounded-xl bg-purple-400 px-4 py-2 font-bold text-slate-950 disabled:opacity-50">{analyzing ? `AI ${analyzeProgress}%` : "Run local AI"}</button>
                     </div>
                   </div>
 

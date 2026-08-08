@@ -17,7 +17,7 @@ from app.player_tracker import PlayerTracker
 from app.action_detector import detect_actions
 from app.schemas import AnalyzeRequest, AnalyzeResponse, CourtPoint
 
-MODEL_VERSION = "volleyvision-ball-training-v0.4"
+MODEL_VERSION = "volleyvision-local-mac-v0.5"
 JOB_TTL_SECONDS = 6 * 60 * 60
 
 app = FastAPI(title="VolleyVision AI Worker", version="0.4.0")
@@ -29,7 +29,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-player_tracker = PlayerTracker()
+player_tracker: PlayerTracker | None = None
+
+
+def get_player_tracker() -> PlayerTracker:
+    global player_tracker
+    if player_tracker is None:
+        print("[ai-worker] Loading local AI models on demand...", flush=True)
+        player_tracker = PlayerTracker()
+    return player_tracker
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="volleyvision-analysis")
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
@@ -110,7 +118,8 @@ def _run_analysis(req: AnalyzeRequest, progress_hook=None) -> dict[str, Any]:
             ratio = current / max(1, total)
             progress_hook(min(94, 8 + int(ratio * 86)), message)
 
-        tracking = player_tracker.track(
+        tracker = get_player_tracker()
+        tracking = tracker.track(
             video_path,
             court_points=court_points,
             progress_callback=tracker_progress,
@@ -144,7 +153,7 @@ def _run_analysis(req: AnalyzeRequest, progress_hook=None) -> dict[str, Any]:
         message = (
             "Tracking complete with occlusion-aware ReID/stitching. "
             f"{tracking['unique_track_count']} stable IDs from {tracking.get('raw_unique_track_count', tracking['unique_track_count'])} raw IDs; "
-            f"{tracking.get('ball_detections', 0)} sports-ball detections and {len(touches)} action candidates. "
+            f"{tracking.get('ball_detections', 0)} custom-volleyball detections and {len(touches)} action candidates. "
             "Action labels are experimental until you review them; corrections are intended to become training data."
         )
 
@@ -202,7 +211,7 @@ def health():
         "ok": True,
         "service": "volleyvision-ai-worker",
         "model_version": MODEL_VERSION,
-        "tracking_device": player_tracker.device,
+        "tracking_device": player_tracker.device if player_tracker is not None else "lazy-local",
         "queued_jobs": sum(
             1 for job in _jobs.values() if job.get("status") in {"queued", "processing"}
         ),
@@ -216,7 +225,7 @@ def track_players(req: TrackRequest):
         raise HTTPException(status_code=404, detail=f"Video not found: {path}")
     court_points = [point.model_dump() for point in req.court_points] if req.court_points else None
     try:
-        return player_tracker.track(str(path), court_points=court_points)
+        return get_player_tracker().track(str(path), court_points=court_points)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Player tracking failed: {exc}") from exc
 
