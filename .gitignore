@@ -16,3 +16,6 @@ apps/web/node_modules/
 *.mkv
 *.avi
 .env.local-worker
+apps/web/.env.local
+storage/local/
+runs/

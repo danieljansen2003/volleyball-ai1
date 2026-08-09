@@ -104,7 +104,7 @@ type Match = {
   upload_progress?: number;
   filename: string;
   file_size?: number;
-  storage_provider: "vercel-blob";
+  storage_provider: "vercel-blob" | "local";
   court_calibration?: CourtCalibration;
   tracking_summary?: TrackingSummary;
 };
@@ -127,7 +127,10 @@ type JobResponse = {
   } | null;
 };
 
-const MATCH_LIBRARY_KEY = "volleyvision-cloud-matches-v2";
+const IS_LOCAL_MODE = process.env.NEXT_PUBLIC_VV_MODE === "local";
+const MATCH_LIBRARY_KEY = IS_LOCAL_MODE ? "volleyvision-local-matches-v1" : "volleyvision-cloud-matches-v2";
+const BALL_LABELS_ENDPOINT = IS_LOCAL_MODE ? "/api/local-ball-labels" : "/api/ball-labels";
+const TRAINING_FEEDBACK_ENDPOINT = IS_LOCAL_MODE ? "/api/local-training-feedback" : "/api/training-feedback";
 const ROSTER_KEY = "volleyvision-roster-v3";
 const MAX_METADATA_MATCHES = 50;
 const MAX_CLIENT_UPLOAD_BYTES = 25 * 1024 * 1024 * 1024;
@@ -185,7 +188,7 @@ export default function Home() {
   const [title, setTitle] = useState("Varsity Match");
   const [opponent, setOpponent] = useState("Opponent");
   const [file, setFile] = useState<File | null>(null);
-  const [storageMessage, setStorageMessage] = useState("Videos upload to Vercel Blob and stay out of Git.");
+  const [storageMessage, setStorageMessage] = useState(IS_LOCAL_MODE ? "LOCAL TRAINING MODE · videos and labels stay on this Mac." : "Videos upload to Vercel Blob and stay out of Git.");
 
   const [loading, setLoading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
@@ -238,7 +241,7 @@ export default function Home() {
   }, [roster]);
 
   useEffect(() => {
-    fetch("/api/ball-labels", { cache: "no-store" })
+    fetch(BALL_LABELS_ENDPOINT, { cache: "no-store" })
       .then((response) => response.json())
       .then((data) => { if (data?.ok) setBallTrainingCount(Number(data.count || 0)); })
       .catch(() => undefined);
@@ -277,7 +280,7 @@ export default function Home() {
     if (!libraryReady) return;
     saveMatchLibrary(matches);
     const total = matches.reduce((sum, match) => sum + (match.file_size || 0), 0);
-    setStorageMessage(`${matches.length} cloud videos · ${bytesToSize(total)} referenced from Vercel Blob`);
+    setStorageMessage(IS_LOCAL_MODE ? `${matches.length} local videos · ${bytesToSize(total)} on this Mac · 0 Blob operations` : `${matches.length} cloud videos · ${bytesToSize(total)} referenced from Vercel Blob`);
   }, [matches, libraryReady]);
 
   useEffect(() => () => {
@@ -324,7 +327,7 @@ export default function Home() {
     if (!selected) return;
     try {
       setFeedbackStatus("Saving reviewed label to the training set...");
-      const response = await fetch("/api/training-feedback", {
+      const response = await fetch(TRAINING_FEEDBACK_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -477,7 +480,7 @@ export default function Home() {
       form.append("width", String(ballLabelBox.width));
       form.append("height", String(ballLabelBox.height));
 
-      const response = await fetch("/api/ball-labels", { method: "POST", body: form });
+      const response = await fetch(BALL_LABELS_ENDPOINT, { method: "POST", body: form });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Could not save ball label.");
       setBallTrainingCount((count) => count + 1);
@@ -580,7 +583,7 @@ export default function Home() {
         upload_progress: 0,
         filename: file.name,
         file_size: file.size,
-        storage_provider: "vercel-blob",
+        storage_provider: IS_LOCAL_MODE ? "local" : "vercel-blob",
       };
 
       setMatches((previous) => [localMatch, ...previous].slice(0, MAX_METADATA_MATCHES));
@@ -590,46 +593,68 @@ export default function Home() {
       setCourtConfirmed(false);
 
       uploadStartedAtRef.current = Date.now();
-      setUploadStatus("Uploading full match to Vercel Blob...");
 
-      try {
-        const blob = await uploadToBlob(pathname, file, {
-          access: "public",
-          handleUploadUrl: "/api/blob-upload",
-          onUploadProgress: (event) => {
-            const loaded = event.loaded || 0;
-            const total = event.total || file.size || 1;
-            const pct = typeof event.percentage === "number"
-              ? event.percentage
-              : Math.round((loaded / Math.max(1, total)) * 100);
-            const safePct = Math.max(1, Math.min(99, Math.round(pct)));
-            const elapsed = Math.max(1, (Date.now() - uploadStartedAtRef.current) / 1000);
-            setUploadProgress(safePct);
-            setUploadSpeed(`${(loaded / 1024 / 1024 / elapsed).toFixed(1)} MB/s · ${bytesToSize(loaded)} / ${bytesToSize(total)}`);
-            setMatches((previous) => previous.map((match) =>
-              match.id === matchId ? { ...match, status: `uploading ${safePct}%`, upload_progress: safePct } : match,
-            ));
-          },
-        });
-
-        const cloudMatch: Match = {
+      if (IS_LOCAL_MODE) {
+        setUploadStatus("Saving full match to this Mac...");
+        const form = new FormData();
+        form.append("file", file);
+        form.append("match_id", String(matchId));
+        const response = await fetch("/api/local-upload", { method: "POST", body: form });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Could not save video locally.");
+        const savedMatch: Match = {
           ...localMatch,
-          status: "saved to Vercel Blob",
-          video_url: blob.url,
+          status: "saved locally",
+          video_url: data.url,
           local_preview_url: localPreviewUrl,
           upload_progress: 100,
+          storage_provider: "local",
         };
         setUploadProgress(100);
-        setUploadStatus("Upload complete. Set the court, then run AI.");
-        setSelected(cloudMatch);
-        setMatches((previous) => previous.map((match) => (match.id === matchId ? cloudMatch : match)));
-      } catch (cloudError) {
-        console.error("Cloud upload failed", cloudError);
-        const localOnly = { ...localMatch, status: "local preview only — cloud upload failed" };
-        setSelected(localOnly);
-        setMatches((previous) => previous.map((match) => (match.id === matchId ? localOnly : match)));
-        setUploadProgress(0);
-        setUploadStatus("Cloud upload failed. Local preview still works.");
+        setUploadStatus("Saved locally. Set the court, then run AI. No Blob usage.");
+        setSelected(savedMatch);
+        setMatches((previous) => previous.map((match) => (match.id === matchId ? savedMatch : match)));
+      } else {
+        setUploadStatus("Uploading full match to Vercel Blob...");
+        try {
+          const blob = await uploadToBlob(pathname, file, {
+            access: "public",
+            handleUploadUrl: "/api/blob-upload",
+            onUploadProgress: (event) => {
+              const loaded = event.loaded || 0;
+              const total = event.total || file.size || 1;
+              const pct = typeof event.percentage === "number"
+                ? event.percentage
+                : Math.round((loaded / Math.max(1, total)) * 100);
+              const safePct = Math.max(1, Math.min(99, Math.round(pct)));
+              const elapsed = Math.max(1, (Date.now() - uploadStartedAtRef.current) / 1000);
+              setUploadProgress(safePct);
+              setUploadSpeed(`${(loaded / 1024 / 1024 / elapsed).toFixed(1)} MB/s · ${bytesToSize(loaded)} / ${bytesToSize(total)}`);
+              setMatches((previous) => previous.map((match) =>
+                match.id === matchId ? { ...match, status: `uploading ${safePct}%`, upload_progress: safePct } : match,
+              ));
+            },
+          });
+
+          const cloudMatch: Match = {
+            ...localMatch,
+            status: "saved to Vercel Blob",
+            video_url: blob.url,
+            local_preview_url: localPreviewUrl,
+            upload_progress: 100,
+          };
+          setUploadProgress(100);
+          setUploadStatus("Upload complete. Set the court, then run AI.");
+          setSelected(cloudMatch);
+          setMatches((previous) => previous.map((match) => (match.id === matchId ? cloudMatch : match)));
+        } catch (cloudError) {
+          console.error("Cloud upload failed", cloudError);
+          const localOnly = { ...localMatch, status: "local preview only — cloud upload failed" };
+          setSelected(localOnly);
+          setMatches((previous) => previous.map((match) => (match.id === matchId ? localOnly : match)));
+          setUploadProgress(0);
+          setUploadStatus("Cloud upload failed. Local preview still works.");
+        }
       }
     } catch (error) {
       console.error(error);
@@ -754,13 +779,13 @@ export default function Home() {
       return alert("Set and confirm the four court corners before running AI.");
     }
     if (!match.video_url || match.video_url.startsWith("blob:")) {
-      return alert("Wait for the Vercel Blob upload to finish before running AI.");
+      return alert(IS_LOCAL_MODE ? "Wait for the local video save to finish before running AI." : "Wait for the Vercel Blob upload to finish before running AI.");
     }
 
     pollCancelledRef.current = true;
     setAnalyzing(true);
     setAnalyzeProgress(0);
-    setAnalyzeStatus("Queuing job for your local Mac AI worker...");
+    setAnalyzeStatus(IS_LOCAL_MODE ? "Queuing local AI job on this Mac..." : "Queuing job for your local Mac AI worker...");
     setTracking(null);
 
     try {
@@ -792,18 +817,18 @@ export default function Home() {
   }
 
   async function deleteMatch(match: Match) {
-    if (!confirm(`Remove "${match.title}" from this app and Vercel Blob?`)) return;
+    if (!confirm(IS_LOCAL_MODE ? `Remove "${match.title}" and its local video file?` : `Remove "${match.title}" from this app and Vercel Blob?`)) return;
     pollCancelledRef.current = true;
     try {
       if (!match.video_url.startsWith("blob:")) {
-        await fetch("/api/blob-delete", {
+        await fetch(IS_LOCAL_MODE ? "/api/local-delete" : "/api/blob-delete", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url: match.video_url }),
         });
       }
     } catch (error) {
-      console.warn("Blob delete failed", error);
+      console.warn(IS_LOCAL_MODE ? "Local video delete failed" : "Blob delete failed", error);
     }
     const remaining = matches.filter((item) => item.id !== match.id);
     setMatches(remaining);
@@ -1009,7 +1034,7 @@ export default function Home() {
                           <div className="font-bold text-yellow-100">Ball training mode · {ballTrainingCount} saved samples</div>
                           <p className="mt-1 text-sm text-yellow-100/75">Labeling stays on while you move through the video. Play or scrub to the next useful moment, pause, draw a tight ball box, save, and continue.</p>
                         </div>
-                        <a href="/api/ball-labels" target="_blank" className="rounded-lg bg-white/10 px-3 py-2 text-xs font-bold">Dataset index</a>
+                        <a href={BALL_LABELS_ENDPOINT} target="_blank" className="rounded-lg bg-white/10 px-3 py-2 text-xs font-bold">Dataset index</a>
                       </div>
 
                       <div className="mt-3 rounded-xl bg-black/20 p-3">
@@ -1074,7 +1099,7 @@ export default function Home() {
                 </div>
 
                 <div className="rounded-2xl bg-white/10 p-5 shadow-xl ring-1 ring-white/10">
-                  <div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="text-xl font-bold">AI action review</h2><p className="mt-1 text-sm text-white/60">AI suggestions are experimental. Correct them here; every saved review becomes durable training data in Vercel Blob.</p></div><a className="rounded-lg bg-white/10 px-3 py-2 text-xs font-bold hover:bg-white/20" href="/api/training-feedback" target="_blank">Training feedback index</a></div>
+                  <div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="text-xl font-bold">AI action review</h2><p className="mt-1 text-sm text-white/60">AI suggestions are experimental. Correct them here; every saved review becomes training data. In local mode it stays on this Mac and immediately helps the review-memory action learner on the next AI run.</p></div><a className="rounded-lg bg-white/10 px-3 py-2 text-xs font-bold hover:bg-white/20" href={TRAINING_FEEDBACK_ENDPOINT} target="_blank">Training feedback index</a></div>
                   <p className="mt-3 rounded-lg bg-cyan-950/40 p-2 text-sm text-cyan-100">{feedbackStatus}</p>
                   <div className="mt-4 max-h-[420px] overflow-auto rounded-xl border border-white/10">
                     <table className="w-full text-sm">

@@ -1,4 +1,6 @@
 import { list, put } from "@vercel/blob";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -7,6 +9,10 @@ export const maxDuration = 30;
 const JOB_PREFIX = "ai-jobs/";
 const RESULT_PREFIX = "ai-job-results/";
 const MAX_QUEUE_SCAN = 200;
+const LOCAL_MODE = process.env.VV_MODE === "local";
+const PROJECT_ROOT = path.resolve(process.cwd(), "../..");
+const LOCAL_JOB_DIR = path.join(PROJECT_ROOT, "storage", "local", "jobs");
+const LOCAL_RESULT_DIR = path.join(PROJECT_ROOT, "storage", "local", "results");
 
 function workerToken(): string | null {
   return process.env.LOCAL_AI_WORKER_TOKEN?.trim() || null;
@@ -59,12 +65,24 @@ async function findJobBlob(jobId: string) {
 }
 
 async function loadJob(jobId: string): Promise<StoredJob | null> {
+  if (LOCAL_MODE) {
+    try {
+      return JSON.parse(await readFile(path.join(LOCAL_JOB_DIR, `${jobId}.json`), "utf8")) as StoredJob;
+    } catch {
+      return null;
+    }
+  }
   const blob = await findJobBlob(jobId);
   if (!blob) return null;
   return readBlobJson<StoredJob>(blob.url);
 }
 
 async function saveJob(job: StoredJob): Promise<void> {
+  if (LOCAL_MODE) {
+    await mkdir(LOCAL_JOB_DIR, { recursive: true });
+    await writeFile(path.join(LOCAL_JOB_DIR, `${job.job_id}.json`), JSON.stringify(job, null, 2));
+    return;
+  }
   await put(jobPath(job.job_id), JSON.stringify(job), {
     access: "public",
     contentType: "application/json",
@@ -76,22 +94,33 @@ async function saveJob(job: StoredJob): Promise<void> {
 async function publicJob(job: StoredJob) {
   let result: unknown = null;
   if (job.status === "complete" && job.result_url) {
-    result = await readBlobJson<unknown>(job.result_url);
+    if (LOCAL_MODE && job.result_url.startsWith("local:")) {
+      result = JSON.parse(await readFile(job.result_url.slice(6), "utf8"));
+    } else {
+      result = await readBlobJson<unknown>(job.result_url);
+    }
   } else if (job.status === "complete" && (job.result_chunk_count || 0) > 0) {
-    // Backward compatibility with jobs created by the earlier chunked worker.
-    const prefix = `${RESULT_PREFIX}${job.job_id}/`;
-    const chunks = await list({ prefix, limit: 1000 });
-    const ordered = chunks.blobs
-      .filter((blob) => blob.pathname.endsWith(".txt"))
-      .sort((a, b) => a.pathname.localeCompare(b.pathname));
-    const parts = await Promise.all(
-      ordered.map(async (blob) => {
-        const response = await fetch(blob.url, { cache: "no-store" });
-        if (!response.ok) throw new Error("Could not read AI result chunk.");
-        return response.text();
-      }),
-    );
-    result = JSON.parse(parts.join(""));
+    if (LOCAL_MODE) {
+      const chunkDir = path.join(LOCAL_RESULT_DIR, job.job_id);
+      const names = (await readdir(chunkDir)).filter((name) => name.endsWith(".txt")).sort();
+      const parts = await Promise.all(names.map((name) => readFile(path.join(chunkDir, name), "utf8")));
+      result = JSON.parse(parts.join(""));
+    } else {
+      // Backward compatibility with jobs created by the earlier chunked worker.
+      const prefix = `${RESULT_PREFIX}${job.job_id}/`;
+      const chunks = await list({ prefix, limit: 1000 });
+      const ordered = chunks.blobs
+        .filter((blob) => blob.pathname.endsWith(".txt"))
+        .sort((a, b) => a.pathname.localeCompare(b.pathname));
+      const parts = await Promise.all(
+        ordered.map(async (blob) => {
+          const response = await fetch(blob.url, { cache: "no-store" });
+          if (!response.ok) throw new Error("Could not read AI result chunk.");
+          return response.text();
+        }),
+      );
+      result = JSON.parse(parts.join(""));
+    }
   }
 
   return {
@@ -108,6 +137,19 @@ async function publicJob(job: StoredJob) {
 }
 
 async function oldestQueuedJob(): Promise<StoredJob | null> {
+  if (LOCAL_MODE) {
+    await mkdir(LOCAL_JOB_DIR, { recursive: true });
+    const names = (await readdir(LOCAL_JOB_DIR)).filter((name) => name.endsWith(".json")).slice(0, MAX_QUEUE_SCAN);
+    const candidates: StoredJob[] = [];
+    for (const name of names) {
+      try {
+        const job = JSON.parse(await readFile(path.join(LOCAL_JOB_DIR, name), "utf8")) as StoredJob;
+        if (job.status === "queued") candidates.push(job);
+      } catch {}
+    }
+    candidates.sort((a, b) => a.created_at - b.created_at);
+    return candidates[0] || null;
+  }
   const blobs = await list({ prefix: JOB_PREFIX, limit: MAX_QUEUE_SCAN });
   const candidates: StoredJob[] = [];
   for (const blob of blobs.blobs) {
@@ -145,7 +187,7 @@ export async function POST(request: Request): Promise<Response> {
     job_id: jobId,
     status: "queued",
     progress: 0,
-    message: "Queued for your local Mac AI worker",
+    message: LOCAL_MODE ? "Queued locally on this Mac" : "Queued for your local Mac AI worker",
     model_version: "local-mac-worker-v1",
     created_at: now,
     updated_at: now,
@@ -219,19 +261,26 @@ export async function PATCH(request: Request): Promise<Response> {
       return Response.json({ error: "A result object is required." }, { status: 400 });
     }
     const serialized = JSON.stringify(result);
-    if (serialized.length > 3_500_000) {
-      return Response.json(
-        { error: "AI result is too large for single-request upload." },
-        { status: 413 },
-      );
+    if (LOCAL_MODE) {
+      await mkdir(LOCAL_RESULT_DIR, { recursive: true });
+      const localResult = path.join(LOCAL_RESULT_DIR, `${jobId}.json`);
+      await writeFile(localResult, serialized);
+      job.result_url = `local:${localResult}`;
+    } else {
+      if (serialized.length > 3_500_000) {
+        return Response.json(
+          { error: "AI result is too large for single-request upload." },
+          { status: 413 },
+        );
+      }
+      const resultBlob = await put(`${RESULT_PREFIX}${jobId}.json`, serialized, {
+        access: "public",
+        contentType: "application/json",
+        addRandomSuffix: false,
+        allowOverwrite: true,
+      });
+      job.result_url = resultBlob.url;
     }
-    const resultBlob = await put(`${RESULT_PREFIX}${jobId}.json`, serialized, {
-      access: "public",
-      contentType: "application/json",
-      addRandomSuffix: false,
-      allowOverwrite: true,
-    });
-    job.result_url = resultBlob.url;
     job.status = "complete";
     job.progress = 100;
     job.message = String(body?.message || "Local AI analysis complete");
@@ -245,12 +294,18 @@ export async function PATCH(request: Request): Promise<Response> {
       return Response.json({ error: "Invalid result chunk." }, { status: 400 });
     }
     const name = `${RESULT_PREFIX}${jobId}/chunk-${String(index).padStart(6, "0")}.txt`;
-    await put(name, data, {
-      access: "public",
-      contentType: "text/plain",
-      addRandomSuffix: false,
-      allowOverwrite: true,
-    });
+    if (LOCAL_MODE) {
+      const chunkDir = path.join(LOCAL_RESULT_DIR, jobId);
+      await mkdir(chunkDir, { recursive: true });
+      await writeFile(path.join(chunkDir, `chunk-${String(index).padStart(6, "0")}.txt`), data);
+    } else {
+      await put(name, data, {
+        access: "public",
+        contentType: "text/plain",
+        addRandomSuffix: false,
+        allowOverwrite: true,
+      });
+    }
     job.result_chunk_count = total;
     job.message = `Uploading AI result ${index + 1}/${total}`;
     job.progress = Math.max(job.progress, 99);

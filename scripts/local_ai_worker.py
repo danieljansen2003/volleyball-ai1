@@ -23,6 +23,7 @@ load_dotenv(PROJECT_ROOT / ".env.local-worker")
 
 from app.main import MODEL_VERSION, _run_analysis  # noqa: E402
 from app.schemas import AnalyzeRequest  # noqa: E402
+from app.action_learner import ActionLearner  # noqa: E402
 
 
 def normalize_url(value: str) -> str:
@@ -96,6 +97,14 @@ def process_job(base: str, token: str, job: dict[str, Any], worker_name: str) ->
 
     print(f"[local-worker] Processing job {job_id}", flush=True)
     result = _run_analysis(req, progress_hook=progress)
+    learner = ActionLearner()
+    result = learner.apply(result)
+    learned = result.get("action_learning", {})
+    print(
+        f"[local-worker] Action learner: {learned.get('reviewed_examples', 0)} reviewed examples, "
+        f"{learned.get('labels_overridden', 0)} labels overridden",
+        flush=True,
+    )
     serialized_size = len(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
     print(
         f"[local-worker] Uploading final result once ({serialized_size / 1024:.1f} KB)...",
@@ -141,7 +150,7 @@ def main() -> None:
     print(f"Web app: {base}", flush=True)
     print(f"Worker:  {worker_name}", flush=True)
     print(
-        "AI runs locally; Vercel only stores the queue/results. Press Ctrl+C to stop.\n",
+        "AI runs locally. When pointed at localhost, videos/jobs/labels stay on this Mac. Press Ctrl+C to stop.\n",
         flush=True,
     )
 
