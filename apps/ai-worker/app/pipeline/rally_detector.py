@@ -21,7 +21,11 @@ def _safe_duration(duration_seconds: float) -> float:
     return 60 * 60
 
 
-def _download_video(url: str, max_mb: int) -> str | None:
+def _download_video(
+    url: str,
+    max_mb: int,
+    extra_headers: dict[str, str] | None = None,
+) -> str | None:
     """
     Download a remote video to a temporary file.
 
@@ -43,6 +47,8 @@ def _download_video(url: str, max_mb: int) -> str | None:
             "User-Agent": "VolleyVision-AI-Worker/0.2",
             "Accept": "video/*,application/octet-stream,*/*",
         }
+        if extra_headers:
+            headers.update(extra_headers)
 
         print(
             f"[video-download] Starting download from {url}",
