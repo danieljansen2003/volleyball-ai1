@@ -10,6 +10,7 @@ const JOB_PREFIX = "ai-jobs/";
 const RESULT_PREFIX = "ai-job-results/";
 const MAX_QUEUE_SCAN = 200;
 const LOCAL_MODE = process.env.VV_MODE === "local";
+const AI_WORKER_URL = (process.env.AI_WORKER_URL || "https://volleyvision-ai-worker.onrender.com").replace(/\\/+$/, "");
 const PROJECT_ROOT = path.resolve(process.cwd(), "../..");
 const LOCAL_JOB_DIR = path.join(PROJECT_ROOT, "storage", "local", "jobs");
 const LOCAL_RESULT_DIR = path.join(PROJECT_ROOT, "storage", "local", "results");
@@ -181,6 +182,26 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
+  if (!LOCAL_MODE) {
+    try {
+      const workerResponse = await fetch(`${AI_WORKER_URL}/jobs/analyze`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(25_000),
+        cache: "no-store",
+      });
+      const raw = await workerResponse.text();
+      return new Response(raw, {
+        status: workerResponse.status,
+        headers: { "Content-Type": workerResponse.headers.get("content-type") || "application/json", "Cache-Control": "no-store" },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not reach the AI worker.";
+      return Response.json({ error: `AI worker unavailable: ${message}` }, { status: 503 });
+    }
+  }
+
   const now = Date.now() / 1000;
   const jobId = `${Date.now()}-${crypto.randomUUID().replace(/-/g, "")}`;
   const job: StoredJob = {
@@ -203,6 +224,26 @@ export async function POST(request: Request): Promise<Response> {
 export async function GET(request: Request): Promise<Response> {
   const url = new URL(request.url);
   const isWorker = url.searchParams.get("worker") === "1";
+
+  if (!LOCAL_MODE && !isWorker) {
+    const jobId = safeJobId(url.searchParams.get("job_id"));
+    if (!jobId) return Response.json({ error: "A valid job_id is required." }, { status: 400 });
+    try {
+      const workerResponse = await fetch(`${AI_WORKER_URL}/jobs/${encodeURIComponent(jobId)}`, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(20_000),
+        cache: "no-store",
+      });
+      const raw = await workerResponse.text();
+      return new Response(raw, {
+        status: workerResponse.status,
+        headers: { "Content-Type": workerResponse.headers.get("content-type") || "application/json", "Cache-Control": "no-store" },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not reach the AI worker.";
+      return Response.json({ error: `AI worker status unavailable: ${message}` }, { status: 503 });
+    }
+  }
 
   if (isWorker) {
     if (!authorized(request)) {
