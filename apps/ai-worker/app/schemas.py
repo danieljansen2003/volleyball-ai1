@@ -13,6 +13,7 @@ class AnalyzeRequest(BaseModel):
     title: str = "Match"
     opponent: str = "Opponent"
     video_url: str = ""
+    video_headers: Optional[dict[str, str]] = None
     upload_id: Optional[str] = None
     duration_seconds: float = 0
     first_serve_seconds: Optional[float] = None
