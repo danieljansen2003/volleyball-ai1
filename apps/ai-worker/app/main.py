@@ -103,7 +103,11 @@ def _run_analysis(req: AnalyzeRequest, progress_hook=None) -> dict[str, Any]:
     if progress_hook:
         progress_hook(3, "Downloading video")
 
-    video_path = _download_video(req.video_url, max_mb=max_mb)
+    video_path = _download_video(
+        req.video_url,
+        max_mb=max_mb,
+        extra_headers=req.video_headers,
+    )
     if not video_path:
         raise RuntimeError(
             "The AI worker could not download the video. Check Render logs for [video-download]."
