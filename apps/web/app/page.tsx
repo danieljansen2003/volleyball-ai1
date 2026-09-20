@@ -760,7 +760,7 @@ export default function Home() {
 
         if (consecutivePollErrors >= maxConsecutivePollErrors) {
           throw new Error(
-            "Lost contact with the AI job status endpoint. The Mac worker may still be processing; refresh the page before starting another job.",
+            "Lost contact with the AI job status endpoint. The cloud worker may still be processing; refresh the page before starting another job.",
           );
         }
 
@@ -785,7 +785,7 @@ export default function Home() {
     pollCancelledRef.current = true;
     setAnalyzing(true);
     setAnalyzeProgress(0);
-    setAnalyzeStatus(IS_LOCAL_MODE ? "Queuing local AI job on this Mac..." : "Queuing job for your local Mac AI worker...");
+    setAnalyzeStatus(IS_LOCAL_MODE ? "Queuing local AI job on this Mac..." : "Queuing video on the VolleyVision cloud AI worker...");
     setTracking(null);
 
     try {
