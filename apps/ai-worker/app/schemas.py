@@ -12,7 +12,8 @@ class AnalyzeRequest(BaseModel):
     match_id: int
     title: str = "Match"
     opponent: str = "Opponent"
-    video_url: str
+    video_url: str = ""
+    upload_id: Optional[str] = None
     duration_seconds: float = 0
     first_serve_seconds: Optional[float] = None
     court_points: Optional[List[CourtPoint]] = None
@@ -53,5 +54,4 @@ class AnalyzeResponse(BaseModel):
     rallies: List[Rally]
     model_version: str
     tracking: Optional[dict[str, Any]] = None
-    action_diagnostics: Optional[dict[str, Any]] = None
     action_diagnostics: Optional[dict[str, Any]] = None
